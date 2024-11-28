@@ -151,6 +151,8 @@ def network(input_shape, depth, kernel_size, filter_size, pooling_size, n_of_ini
     model = Model(inputs=input_tensor, outputs=output_tensor)
     return model
 
+#These are just to investigate the model
+#so far it looks good. The model has to be trained though
 depth = 5
 kernel_size = 3
 filter_size = 2
