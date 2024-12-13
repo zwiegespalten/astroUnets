@@ -39,6 +39,8 @@ def text_write(filepath, epoch, cnt, loss,mean_loss, time, name):
 def black_level(H, W, out, ps=256, steps=100):
     lowest_per = 1
     indices = (0,0)
+    if H < ps or W < ps:
+        return
     try:
         for i in range(steps):
             xx = np.random.randint(0, H - ps)
@@ -82,7 +84,8 @@ def poisson_noise(img_data, ratio=0.5, ex_time=1, xx=0, yy=0, ps=256, ron=3, dk=
     return noisy_img
 
 def out_in_image(filepath, ps=256, steps=100, ratio=0.5, ron=3, dk=7, save=False,
-                  sv_name=None, path=None, patch_noise=False, type_of_image='SCI'):
+                  sv_name=None, path=None, patch_noise=False, type_of_image='SCI',
+                  low=60, high=10000):
     out = None
     ex_time = None
     try:
@@ -97,7 +100,7 @@ def out_in_image(filepath, ps=256, steps=100, ratio=0.5, ron=3, dk=7, save=False
     except Exception as err:
         logging.warning(f'an error occurred while reading from the .fits file: {err}')
         return
-    if out is None or ex_time is None:
+    if out is None or ex_time is None or ex_time*ratio < low or ex_time*ratio > high:
         return 
     # ground truth
     try:
@@ -124,7 +127,7 @@ def out_in_image(filepath, ps=256, steps=100, ratio=0.5, ron=3, dk=7, save=False
     return  gt_patch, in_patch, ex_time*ratio
 
 def data_augment(images, start=2, stop=6, ps=256, steps=100, ratio=0.5, ron=3, dk=7, save=False,
-                  sv_name=None, path=None, patch_noise=False, type_of_image='SCI'):
+                  sv_name=None, path=None, patch_noise=False, type_of_image='SCI', low=60, high=10000):
     if start >= stop:
         raise ValueError("`start` must be less than `stop`.")
     try:
@@ -137,7 +140,8 @@ def data_augment(images, start=2, stop=6, ps=256, steps=100, ratio=0.5, ron=3, d
                 yield out_in_image(key, ps, steps, ratio=ratio,
                                    ron=ron, dk=dk, save=save, sv_name=sv_name,
                                    path=path, patch_noise=patch_noise,
-                                   type_of_image=type_of_image), key
+                                   type_of_image=type_of_image,
+                                   low=low, high=high), key
             else:
                 temp.pop(key)
     except Exception as err:
@@ -147,6 +151,54 @@ def data_augment(images, start=2, stop=6, ps=256, steps=100, ratio=0.5, ron=3, d
 ############ VALIDATION AND TRAINING ##########################################################################
 ###############################################################################################################
 ###############################################################################################################
+
+def restore_checkpoint(checkpoint, checkpoint_dir, checkpoint_prefix, epoch):
+    """Helper function to restore a checkpoint."""
+    filename = f'{checkpoint_prefix}_{epoch:04d}.ckpt'
+    suffix = [f.split('.')[1].split('-')[-1] for f in os.listdir(checkpoint_dir) if f.startswith(filename) and f.endswith('.index')]
+    if suffix:
+        filename = f'{filename}-{suffix[0]}'
+        checkpoint_path = os.path.join(checkpoint_dir, filename)
+        try:
+            checkpoint.restore(checkpoint_path).assert_consumed()
+            return epoch
+        except Exception as err:
+            logging.warning(f"An error occurred while trying to restore the epoch {epoch}: {err}")
+    return None
+
+def load_checkpoint(checkpoint, checkpoint_dir, start_from_best, start_from_last, start_from_scratch):
+    """Load the appropriate checkpoint based on the flags."""
+    if start_from_best == start_from_last:
+        raise ValueError("Cannot start from both 'best' and 'last' checkpoints simultaneously.")
+    if start_from_scratch and os.path.exists(checkpoint_dir):
+        shutil.rmtree(checkpoint_dir)
+    
+    start_epoch = 0
+    
+    # Get lists of available best epochs and model epochs
+    best_epochs = sorted({int(f.split('.')[0].split('_')[-1]) for f in os.listdir(checkpoint_dir) if f.startswith('best_')})
+    epochs = sorted({int(f.split('.')[0].split('_')[1]) for f in os.listdir(checkpoint_dir) if f.startswith('model_')})
+    
+    # Try restoring from the best epochs first
+    if best_epochs and start_from_best and not start_from_last:
+        for epoch in reversed(best_epochs):
+            start_epoch = restore_checkpoint(checkpoint, checkpoint_dir, 'best_model', epoch)
+            if start_epoch:
+                return start_epoch
+        start_from_best = False
+        start_from_last = True
+        logging.warning('no best checkpoint has been found, changing to the last working checkpoint')
+
+    # If no best epoch was restored, or we are falling back to the last checkpoint
+    if epochs and start_from_last and not start_from_best:
+        for epoch in reversed(epochs):
+            start_epoch = restore_checkpoint(checkpoint, checkpoint_dir, 'model', epoch)
+            if start_epoch:
+                return start_epoch
+    if not start_epoch:
+        logging.warning("No valid checkpoint found, starting from scratch.")
+    return 0
+
 def validate(model, eval_data, G_loss_fn, kwargs_data):
     try:
         if not isinstance(model, tf.keras.models.Model):
@@ -183,7 +235,7 @@ def one_step_training(model, result, G_loss_fn, optimizer):
     #if not isinstance(optimizer, tf.keras.optimizers.Optimizer):
     #    raise ValueError("The 'optimizer' must be an instance of tf.keras.optimizers")
     if not isinstance(result, (tuple, list)) or len(result) != 3:
-        raise ValueError("The 'result' must be a tuple or list with exactly three elements.")
+        return
     try:
         gt_patch, in_patch, exp = result
     except ValueError as e:
@@ -198,8 +250,8 @@ def one_step_training(model, result, G_loss_fn, optimizer):
     optimizer.apply_gradients(zip(gradients, model.trainable_variables))
     return gt_patch, in_patch, predicted, G_current, exp
 
-def main(input_shape, folder, n_epochs, kwargs_data, kwargs_network, network_name='model',
-         learning_rate=1e-4, optimizer=Adam,change_learning_rate=(2000, 1e-5), G_loss_fn=tf.keras.losses.MeanAbsoluteError(),
+def train_network(input_shape, folder, n_epochs, kwargs_data, kwargs_network, network_name='model',
+         learning_rate=1e-4, optimizer=Adam, change_learning_rate=(2000, 1e-5), G_loss_fn=tf.keras.losses.MeanAbsoluteError(),
          start_from_scratch=False, start_from_best=False, start_from_last=True,
          save_freq=500, period_percent=10, eval_percent=20, period_save=30):
     
@@ -213,7 +265,7 @@ def main(input_shape, folder, n_epochs, kwargs_data, kwargs_network, network_nam
     if not callable(G_loss_fn):
         raise ValueError("The 'G_loss_fn' must be callable.")
     
-    #Reading the imge filepaths from files residing in the resepective folders
+    #Reading the imge filepaths from files residing in the respective folders
     training_path = f'{os.getcwd()}/training'
     eval_path = f'{os.getcwd()}/eval'
     if os.path.exists(training_path):
@@ -227,7 +279,7 @@ def main(input_shape, folder, n_epochs, kwargs_data, kwargs_network, network_nam
     
     #Creation of folders
     try:
-        results_folder = os.path.join(os.getcwd(), network_name)
+        results_folder = os.path.join(os.getcwd(), 'models', network_name)
         if not os.path.exists(results_folder):
             os.makedirs(results_folder, exist_ok=True)
         os.chdir(results_folder)
@@ -242,40 +294,20 @@ def main(input_shape, folder, n_epochs, kwargs_data, kwargs_network, network_nam
     model = network(input_shape, **kwargs_network)
     optimizer = optimizer(learning_rate=learning_rate)
 
-    # Definition of parameters
-    g_loss = []
-    eval_loss = []
-    G_current = []
-    best_loss = float('inf')
-    start_epoch = 0
-
     # Checkpoints
     checkpoint_dir = './checkpoints'
     checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
     checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
-
     # Restoring checkpoints
-    if start_from_best == start_from_last:
-        raise ValueError("Cannot start from both 'best' and 'last' checkpoints simultaneously.")
-    elif start_from_scratch:
-        shutil.rmtree(checkpoint_dir)
-    elif os.path.exists(checkpoint_dir):
-        best_epochs = [int(f.split('.')[0].split('_')[-1]) for f in os.listdir(checkpoint_dir) if f.startswith('best_') and f.endswith('.ckpt.index')]
-        epochs = [int(f.split('.')[0].split('_')[1]) for f in os.listdir(checkpoint_dir) if f.endswith('.ckpt.index')]
-        if best_epochs:
-            epoch = max(best_epochs)
-            checkpoint_path = os.path.join(checkpoint_dir, f'best_model_{epoch:04d}.ckpt')
-            if start_from_best and not start_from_last:
-                checkpoint.restore(checkpoint_path).assert_consumed()
-                start_epoch = epoch
-        if epochs:
-            if not start_from_best and start_from_last:
-                start_epoch = max(epochs)
-                checkpoint_path = os.path.join(checkpoint_dir, f'model_{start_epoch:04d}.ckpt')
-                checkpoint.restore(checkpoint_path).assert_consumed()
+    start_epoch = load_checkpoint(checkpoint, checkpoint_dir, start_from_best, start_from_last, start_from_scratch)
+
+    # Definition of parameters
+    G_current = []
+    best_loss = float('inf')
 
     #Start Training
     for epoch in range(start_epoch + 1, n_epochs + 1):
+        begin = time.time()
         epoch_loss = []
         epoch_eval_loss = []
 
@@ -295,33 +327,33 @@ def main(input_shape, folder, n_epochs, kwargs_data, kwargs_network, network_nam
             gt_patch, in_patch, predicted, G_current, exp = result
 
             epoch_loss.append(G_current.numpy())
-            g_loss.append(G_current.numpy())
-            print(f"{epoch} {cnt} Loss={np.mean(g_loss):.3f} Time={time.time() - st:.3f} Exposure={exp:.0f}")
+            print(f"{epoch} {cnt} Loss={np.mean(G_current):.3f} Time={time.time() - st:.3f} Exposure={exp:.0f}")
 
             # Periodic logging
             if cnt % max(1, ((len(temp) * period_percent) // 100)) == 0:
-                text_write(name_txt_file, epoch, len(epoch_loss), g_loss[-1], np.mean(g_loss), time.time()-st, filepath.split('/')[-1])
+                text_write(name_txt_file, epoch, cnt, epoch_loss[-1], np.mean(epoch_loss), time.time()-st, filepath.split('/')[-1])
 
             # Validation
             if cnt % max(1, ((len(temp) * eval_percent) // 100)) == 0:
+                time_eval = time.time()
                 result = validate(model, eval_data,  G_loss_fn, kwargs_data)
                 if result is not None:
                     eval_current, eval_exp = result
-                    diff = eval_current.numpy().flatten().sum()
+                    diff = eval_current.numpy().mean()
                     if diff < best_loss:
                         checkpoint_path = f'{checkpoint_dir}/best_model_{epoch:04d}.ckpt'
-                        for file in os.listdir(checkpoint_dir):
-                            if f'best_model_' in file:
-                                try:
-                                    os.remove(os.path.join(checkpoint_dir, file))
-                                except Exception as err:
-                                    logging.warning(f'an error occurred while deleting the old best model files: {err}')
+                        #if os.path.exists(checkpoint_dir):
+                            #for file in os.listdir(checkpoint_dir):
+                            #    if f'best_model_' in file:
+                            #        try:
+                            #            os.remove(os.path.join(checkpoint_dir, file))
+                            #        except Exception as err:
+                            #            logging.warning(f'an error occurred while deleting the old best model files: {err}')
                         checkpoint.save(checkpoint_path)
                         best_loss = diff
 
-                    eval_loss.append(eval_current.numpy())
                     epoch_eval_loss.append(eval_current.numpy())
-                    text_write(name_txt_file_eval, epoch, cnt, eval_current.numpy(), np.mean(epoch_eval_loss), np.mean(eval_loss), filepath.split('/')[-1])
+                    text_write(name_txt_file_eval, epoch, cnt, eval_current.numpy(), np.mean(epoch_eval_loss), time.time()-time_eval, filepath.split('/')[-1])
             
             # Save outputs periodically
             if epoch % save_freq == 0 and cnt % max(1, ((len(temp) * period_save) // 100)) == 0:
@@ -336,37 +368,60 @@ def main(input_shape, folder, n_epochs, kwargs_data, kwargs_network, network_nam
         if epoch % save_freq == 0:
             checkpoint_path = f'{checkpoint_dir}/model_{epoch:04d}.ckpt'
             checkpoint.save(checkpoint_path)
-        text_write(name_txt_file_epoch, epoch, len(train_data), np.mean(epoch_loss),  np.mean(g_loss), '0', filepath.split('/')[-1])
+        text_write(name_txt_file_epoch, epoch, len(train_data), np.mean(epoch_loss),  '0', time.time()-begin, filepath.split('/')[-1])
 
-input_shape = (256, 256, 1)
-folder = './original_dataset'
-n_epochs = 100
-network_name ='model'
-kwargs_data = {
-    'ps':256,
-    'steps':100,
-    'dk':7, 
-    'ron':3,
-    'patch_noise':False,
-    'ratio':0.5,
-    'save':False,
-    'sv_name':None,
-    'path':None,
-    'patch_noise':False, 
-    'type_of_image':'SCI'
-}
+def __main__():
 
-kwargs_network = {
-    'depth':5,
-    'kernel_size':3,
-    'filter_size':2,
-    'pooling_size':2,
-    'n_of_initial_channels':32, 
-    'func':tf.keras.layers.LeakyReLU,
-    'batch_normalization':True,
-    'exp' : None,
-    'exp_time':None
-}
+    kwargs_data = {
+        'ps':256,
+        'steps':100,
+        'dk':7, 
+        'ron':3,
+        'patch_noise':False,
+        'ratio':0.5,
+        'save':False,
+        'sv_name':None,
+        'path':None,
+        'patch_noise':False, 
+        'type_of_image':'SCI',
+        'low' : 60,
+        'high' : 10000
+    }
+    kwargs_network = {
+        'depth':5,
+        'kernel_size':3,
+        'filter_size':2,
+        'pooling_size':2,
+        'n_of_initial_channels':32, 
+        'func':tf.keras.layers.LeakyReLU,
+        'batch_normalization':True,
+        'exp' : None,
+        'exp_time':None
+    }
 
-print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
-main(input_shape, folder , n_epochs, kwargs_data, kwargs_network, save_freq=1, period_percent=2, eval_percent=2, period_save=3)
+    input_shape = (256, 256, 1)
+    folder = './original_dataset'
+    n_epochs = 100
+    network_name='model'
+    learning_rate=1e-4
+    optimizer=Adam
+    change_learning_rate=(2000, 1e-5)
+    G_loss_fn=tf.keras.losses.MeanAbsoluteError()
+    start_from_scratch=False
+    start_from_best=True
+    start_from_last=False
+    save_freq=500
+    period_percent=10
+    eval_percent=20
+    period_save=30
+
+    print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
+    train_network(input_shape, folder, n_epochs, kwargs_data, kwargs_network,
+                  network_name=network_name, learning_rate=learning_rate,
+                  optimizer=optimizer,change_learning_rate=change_learning_rate,
+                  G_loss_fn=G_loss_fn, start_from_scratch=start_from_scratch,
+                  start_from_best=start_from_best, start_from_last=start_from_last,
+                  save_freq=save_freq, period_percent=period_percent,
+                  eval_percent=eval_percent, period_save=period_save
+                  )
+__main__()
