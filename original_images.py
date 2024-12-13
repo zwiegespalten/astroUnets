@@ -181,6 +181,7 @@ def create_histograms(txt_filepath, filters):
     data = create_metadata_file(all_filenames, '', save=False)
     plot_histogram(data['EXPTIME'], output_filename=f'{txt_filepath}/hist_org.png', title=f'Histogram of Images with {suptitle}')
     
+
 save_dir = './original_dataset'
 txt_filepath = f'{save_dir}/all_dataset.txt'
 output_filepath = f'{save_dir}/metadata_original_images.csv'
@@ -199,12 +200,15 @@ hist_kwargs = {
     'output_filename' : f'{save_dir}/hist_original_images.png',
     'loc' : 'upper right'
 }
+directory_path = os.path.dirname(os.path.abspath(__file__))
+os.chdir(directory_path)
+
 #main(txt_filepath, output_filepath, column, url_column, save_dir, max_requests, reset_after,
 #          max_workers, download, period, step, mission, hist_kwargs)
 
-image_filepath = './data'
-filters = ['F555W', 'F606W']
-create_histograms(save_dir, filters)
+#image_filepath = './data'
+#filters = ['F555W', 'F606W']
+#create_histograms(save_dir, filters)
 
 output_filepath = './hst_wfc3_f160W_metadata.csv'
 update_file(output_filepath, column, url_column, save_dir, max_requests, reset_after, max_workers, download, period, step)

@@ -70,6 +70,8 @@ def create_histograms(txt_filepath, filters):
     data = create_metadata_file(all_filenames, '', save=False)
     plot_histogram(data['EXPTIME'], output_filename=f'{txt_filepath}/hist_org.png', title=f'Histogram of Images with {suptitle}')
 
+directory_path = os.path.dirname(os.path.abspath(__file__))
+os.chdir(directory_path)
 txt_filepath = './original_dataset'
 image_filepath = './data'
 filters = ['F555W', 'F606W']

@@ -410,10 +410,13 @@ def __main__():
     start_from_scratch=False
     start_from_best=True
     start_from_last=False
-    save_freq=500
-    period_percent=10
+    save_freq=100
+    period_percent=30
     eval_percent=20
-    period_save=30
+    period_save=20
+
+    directory_path = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(directory_path)
 
     print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
     train_network(input_shape, folder, n_epochs, kwargs_data, kwargs_network,

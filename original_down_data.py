@@ -1,6 +1,9 @@
 import os, logging
 import urllib.request
 
+directory_path = os.path.dirname(os.path.abspath(__file__))
+os.chdir(directory_path)
+
 directory = './original_dataset'
 txt_files = [os.path.join(directory, f'{f}') for f in os.listdir(directory) if f.endswith('.txt') and 'all' not in f]
 for txt_file in txt_files:
