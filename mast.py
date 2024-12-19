@@ -96,7 +96,7 @@ def plot_histogram(data, bins=20, label=None, xlabel='Exposure Time (s)', ylabel
     plt.savefig(output_filename, dpi=300)
     plt.show()
 
-async def download_image(id_, url, save_dir, session, semaphore):
+async def download_image(id_, url, save_dir, session, semaphore, filename):
     async with semaphore:
         try:
             if not session:
@@ -107,8 +107,8 @@ async def download_image(id_, url, save_dir, session, semaphore):
 
                     content = await response.read()
                     os.makedirs(save_dir, exist_ok=True)
-                    file_name = f"{id_}_raw.fits"
-                    file_path = os.path.join(save_dir, file_name)
+                    #file_name = f"{id_}_raw.fits"
+                    file_path = os.path.join(save_dir, filename)
 
                     with fits.open(io.BytesIO(content)) as hdul:
                         hdul.writeto(file_path, overwrite=True)
@@ -127,8 +127,10 @@ async def download_images(ids, urls, save_dir, max_requests=5, reset_after=10):
                 if session:
                     await session.close()
                 session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
-
-            result = await download_image(id_, url, save_dir, session, semaphore)
+            if pd.isna(url):
+                continue
+            filename = url.split('%2F')[-1]
+            result = await download_image(id_, url, save_dir, session, semaphore, filename)
         if session:
             await session.close()
         return result

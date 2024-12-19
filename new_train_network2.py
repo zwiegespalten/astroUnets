@@ -1,5 +1,7 @@
-import os, logging, time, shutil
+import os, logging, time, shutil, inspect
+import threading
 import random
+from queue import Queue
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.optimizers import Adam
@@ -10,6 +12,26 @@ from network import network
 ############DATA HANDLING ##################################
 ############################################################
 ############################################################
+def open_fits(filepath, ratio, type_of_image='SCI', low=60, high=10000):
+    out = None
+    ex_time = None
+    try:
+        with fits.open(filepath) as f:
+            for i in range(len(f)):
+                hdu = f[i]
+                if isinstance(hdu, (fits.PrimaryHDU, fits.ImageHDU, fits.CompImageHDU)) and hdu.data is not None and isinstance(hdu.data, np.ndarray):
+                    if out is None and type_of_image.lower() == str(hdu.name).lower():
+                        out = hdu.data
+                if ex_time is None and 'EXPTIME' in hdu.header:
+                    ex_time = hdu.header['EXPTIME']
+    except Exception as err:
+        logging.warning(f'an error occurred while reading from the .fits file: {err}')
+        return None
+
+    if out is None or ex_time is None or ex_time * ratio < low or ex_time * ratio > high:
+        return None
+    return out, filepath, ex_time, ratio
+
 def save_fits(image, name, path):
     try:
         hdu = fits.PrimaryHDU(image)
@@ -35,7 +57,6 @@ def text_write(filepath, epoch, cnt, loss,mean_loss, time, name):
 #############CROPPING, NOISE ADDITION AND DATA AUGMENTATIONS###################################################
 ###############################################################################################################
 ###############################################################################################################
-
 def black_level(H, W, out, ps=256, steps=100):
     lowest_per = 1
     indices = (0,0)
@@ -83,26 +104,10 @@ def poisson_noise(img_data, ratio=0.5, ex_time=1, xx=0, yy=0, ps=256, ron=3, dk=
         save_fits(noisy_img, sv_name, path)
     return noisy_img
 
-def out_in_image(filepath, ps=256, steps=100, ratio=0.5, ron=3, dk=7, save=False,
-                  sv_name=None, path=None, patch_noise=False, type_of_image='SCI',
-                  low=60, high=10000):
-    out = None
-    ex_time = None
-    try:
-        with fits.open(filepath) as f:
-            for i in range(len(f)):
-                hdu = f[i]
-                if isinstance(hdu, (fits.PrimaryHDU, fits.ImageHDU, fits.CompImageHDU)) and hdu.data is not None and isinstance(hdu.data, np.ndarray):
-                    if out is None and type_of_image.lower() == str(hdu.name).lower():
-                        out = hdu.data
-                if ex_time is None and 'EXPTIME' in hdu.header:
-                    ex_time = hdu.header['EXPTIME'] 
-    except Exception as err:
-        logging.warning(f'an error occurred while reading from the .fits file: {err}')
+def out_in_image(out, ex_time, ps=256, steps=100, ratio=0.5, ron=3, dk=7, save=False,
+                  sv_name=None, path=None, patch_noise=False):
+    if out is None or ex_time is None:
         return
-    if out is None or ex_time is None or ex_time*ratio < low or ex_time*ratio > high:
-        return 
-    # ground truth
     try:
         H, W = out.shape[0], out.shape[1]
         xx, yy = black_level(H, W, out, ps=ps, steps=steps)
@@ -126,24 +131,55 @@ def out_in_image(filepath, ps=256, steps=100, ratio=0.5, ron=3, dk=7, save=False
         return
     return  gt_patch, in_patch, ex_time*ratio
 
+def file_loader(images, queue, n_concurrent_files = 5, ps =256, steps=100,
+                type_of_image='SCI', low=60, high=100, sleep=0.03,
+                ratio=0.5,ron=3, dk=7, save=False, sv_name=None,
+                path=None, patch_noise=False, flag={'continue':True}):
+    """Background thread that loads files and puts them into the queue."""
+    while images and flag['continue']:
+        if queue.qsize() < n_concurrent_files:
+
+            filepath = random.choice(list(images.keys()))
+            if images[filepath]:
+                ratio = images[filepath][-1]
+
+                file = open_fits(filepath, ratio, type_of_image, low, high)
+                if file:
+                    out, filepath, exp_time, ratio_ = file
+                    result  = out_in_image(out, exp_time, ps, steps, ratio=ratio_,
+                                ron=ron, dk=dk, save=save, sv_name=sv_name,
+                                path=path, patch_noise=patch_noise)
+                    if result:
+                        queue.put((result, filepath))
+                images[filepath].pop()
+                if not images[filepath]:
+                    del images[filepath]
+            else:
+                del images[filepath]
+        time.sleep(sleep)
+
 def data_augment(images, start=2, stop=6, ps=256, steps=100, ratio=0.5, ron=3, dk=7, save=False,
-                  sv_name=None, path=None, patch_noise=False, type_of_image='SCI', low=60, high=10000):
+                sv_name=None, path=None, patch_noise=False, type_of_image='SCI', low=60, high=10000,
+                sleep=0.03, n_concurrent_files=5):
     if start >= stop:
         raise ValueError("`start` must be less than `stop`.")
     try:
-        temp = {image: random.sample(range(start, stop), stop - start) for image in images}
-        while temp:
-            key = random.choice(list(temp))
-            if temp[key]:
-                ratio = temp[key].pop()
-                ratio = 1 / ratio
-                yield out_in_image(key, ps, steps, ratio=ratio,
-                                   ron=ron, dk=dk, save=save, sv_name=sv_name,
-                                   path=path, patch_noise=patch_noise,
-                                   type_of_image=type_of_image,
-                                   low=low, high=high), key
-            else:
-                temp.pop(key)
+        data = {image: random.sample(range(start, stop), stop - start) for image in images}
+        """Main generator that yields files as they are processed."""
+        flag={'continue':True}
+        queue = Queue()
+        loader_thread = threading.Thread(target=file_loader, args=(data, queue, n_concurrent_files, ps, steps,
+                                                                 type_of_image, low, high, sleep,ratio, ron, dk,
+                                                                  save, sv_name, path, patch_noise, flag))
+        loader_thread.daemon = True
+        loader_thread.start()
+
+        while data or not queue.empty():
+            file = queue.get()
+            yield file
+        flag['continue'] = False
+        loader_thread.join()
+        
     except Exception as err:
         logging.error(f"Error during data augmentation: {err}")
         raise Exception('EXITING')
@@ -168,33 +204,35 @@ def restore_checkpoint(checkpoint, checkpoint_dir, checkpoint_prefix, epoch):
 
 def load_checkpoint(checkpoint, checkpoint_dir, start_from_best, start_from_last, start_from_scratch):
     """Load the appropriate checkpoint based on the flags."""
+    start_epoch = 0
     if start_from_best == start_from_last:
         raise ValueError("Cannot start from both 'best' and 'last' checkpoints simultaneously.")
     if start_from_scratch and os.path.exists(checkpoint_dir):
         shutil.rmtree(checkpoint_dir)
-    
-    start_epoch = 0
+        return start_epoch
     
     # Get lists of available best epochs and model epochs
-    best_epochs = sorted({int(f.split('.')[0].split('_')[-1]) for f in os.listdir(checkpoint_dir) if f.startswith('best_')})
-    epochs = sorted({int(f.split('.')[0].split('_')[1]) for f in os.listdir(checkpoint_dir) if f.startswith('model_')})
+    if os.path.exists(checkpoint_dir):
+        best_epochs = sorted({int(f.split('.')[0].split('_')[-1]) for f in os.listdir(checkpoint_dir) if f.startswith('best_')})
+        epochs = sorted({int(f.split('.')[0].split('_')[1]) for f in os.listdir(checkpoint_dir) if f.startswith('model_')})
     
-    # Try restoring from the best epochs first
-    if best_epochs and start_from_best and not start_from_last:
-        for epoch in reversed(best_epochs):
-            start_epoch = restore_checkpoint(checkpoint, checkpoint_dir, 'best_model', epoch)
-            if start_epoch:
-                return start_epoch
-        start_from_best = False
-        start_from_last = True
-        logging.warning('no best checkpoint has been found, changing to the last working checkpoint')
+        # Try restoring from the best epochs first
+        if best_epochs and start_from_best and not start_from_last:
+            for epoch in reversed(best_epochs):
+                start_epoch = restore_checkpoint(checkpoint, checkpoint_dir, 'best_model', epoch)
+                if start_epoch:
+                    return start_epoch
+            start_from_best = False
+            start_from_last = True
+            logging.warning('no best checkpoint has been found, changing to the last working checkpoint')
 
-    # If no best epoch was restored, or we are falling back to the last checkpoint
-    if epochs and start_from_last and not start_from_best:
-        for epoch in reversed(epochs):
-            start_epoch = restore_checkpoint(checkpoint, checkpoint_dir, 'model', epoch)
-            if start_epoch:
-                return start_epoch
+        # If no best epoch was restored, or we are falling back to the last checkpoint
+        if epochs and start_from_last and not start_from_best:
+            for epoch in reversed(epochs):
+                start_epoch = restore_checkpoint(checkpoint, checkpoint_dir, 'model', epoch)
+                if start_epoch:
+                    return start_epoch
+
     if not start_epoch:
         logging.warning("No valid checkpoint found, starting from scratch.")
     return 0
@@ -212,13 +250,18 @@ def validate(model, eval_data, G_loss_fn, kwargs_data):
             return
 
         filepath_eval = random.choice(eval_data)
-        eval_result = out_in_image(filepath_eval, **kwargs_data)
+        filtered_kwargs = {k: v for k, v in kwargs_data.items() if k in inspect.signature(open_fits).parameters.keys()}
+        file = open_fits(filepath_eval, **filtered_kwargs)
+        if not file:
+            return 
+        
+        out_eval, filepath_eval, ex_time, ratio = file
+        filtered_kwargs = {k: v for k, v in kwargs_data.items() if k in inspect.signature(out_in_image).parameters.keys() and k != 'ratio'}
+        eval_result = out_in_image(out_eval, ex_time, ratio=ratio, **filtered_kwargs)
         if eval_result is None:
             return
-        try:
-            out_eval, in_eval, exp = eval_result
-        except ValueError as e:
-            return
+        
+        out_eval, in_eval, exp = eval_result
         
         eval_prediction = model(in_eval, training=False)
         eval_current = G_loss_fn(out_eval, eval_prediction)
@@ -327,7 +370,7 @@ def train_network(input_shape, folder, n_epochs, kwargs_data, kwargs_network, ne
             gt_patch, in_patch, predicted, G_current, exp = result
 
             epoch_loss.append(G_current.numpy())
-            print(f"{epoch} {cnt} Loss={np.mean(G_current):.3f} Time={time.time() - st:.3f} Exposure={exp:.0f}")
+            logging.warning(f"{epoch} {cnt} Loss={np.mean(G_current):.3f} Time={time.time() - st:.3f} Exposure={exp:.0f}")
 
             # Periodic logging
             if cnt % max(1, ((len(temp) * period_percent) // 100)) == 0:
@@ -385,7 +428,9 @@ def __main__():
         'patch_noise':False, 
         'type_of_image':'SCI',
         'low' : 60,
-        'high' : 10000
+        'high' : 10000,
+        'sleep' : 0.1,
+        'n_concurrent_files' : 10
     }
     kwargs_network = {
         'depth':5,
@@ -401,12 +446,12 @@ def __main__():
 
     input_shape = (256, 256, 1)
     folder = './original_dataset'
-    n_epochs = 100
+    n_epochs = 3000
     network_name='model'
     learning_rate=1e-4
     optimizer=Adam
     change_learning_rate=(2000, 1e-5)
-    G_loss_fn=tf.keras.losses.MeanAbsoluteError()
+    G_loss_fn=MeanAbsoluteError()
     start_from_scratch=False
     start_from_best=True
     start_from_last=False
@@ -418,7 +463,7 @@ def __main__():
     directory_path = os.path.dirname(os.path.abspath(__file__))
     os.chdir(directory_path)
 
-    print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
+    logging.warning("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
     train_network(input_shape, folder, n_epochs, kwargs_data, kwargs_network,
                   network_name=network_name, learning_rate=learning_rate,
                   optimizer=optimizer,change_learning_rate=change_learning_rate,
