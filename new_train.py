@@ -2,6 +2,7 @@ import os, logging, time, shutil, json
 import random
 import numpy as np
 import pandas as pd
+from scipy.signal import convolve2d
 import tensorflow as tf
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import MeanAbsoluteError
@@ -132,7 +133,6 @@ class Callback(tf.keras.callbacks.Callback):
             df.to_csv(csv_path, index=False)
         except Exception as err:
             logging.warning(f"An error occurred while saving the CSV file: {err}")
-
 
         # PERIODIC MODEL SAVE
         if self.current_epoch % max(int(self.save_freq), 1) == 0:
@@ -310,6 +310,248 @@ def out_in_image(gt_patch, func, kwargs_data):
 
     return gt_patch, in_patch
 
+####### NEW DATA AUGMENTATION ################################################
+def open_fits_2(filepath):
+    try:
+        with fits.open(filepath) as f:
+            for hdu in f:
+                if isinstance(hdu, (fits.PrimaryHDU, fits.ImageHDU, fits.CompImageHDU)) and hdu.data is not None and isinstance(hdu.data, np.ndarray):
+                    return hdu.data
+    except Exception as err:
+        logging.warning(f"Error reading .fits file {filepath}: {err}")
+    return None
+
+def linear_function(x, a, b):
+    return a * x + b
+
+def power_law(x, t, a):
+    return a * (x ** t)
+
+def prepare_data(sampled_data, fit_data, training):
+    names = sampled_data['name'].tolist()
+    data = {}
+    for index, row in sampled_data.iterrows():
+        names.pop(0)
+        filepath = row['name']
+        file = None
+        if filepath in data:
+            file = data[filepath]
+        else:
+            if training == False:
+                train_eval = 'eval'
+            else:
+                train_eval = 'training'
+
+            actual_filepath = f'{os.path.dirname(__file__)}/our_data/{train_eval}/{filepath}'
+            file = open_fits_2(actual_filepath)
+            if file is not None:
+                file = np.nan_to_num(file, nan=0)
+                if filepath in names:
+                    data[filepath] = file
+
+        t = fit_data['t'].values[0]
+        a = fit_data['a'].values[0]
+        dt = np.random.uniform(-fit_data['dt'].values[0], fit_data['dt'].values[0])
+        da = np.random.uniform(-fit_data['da'].values[0], fit_data['da'].values[0])
+        t += dt
+        a += da
+        sigma_2 = power_law(row['exp_time'], t, a)
+        sigma_kernel_2 = sigma_2 - row['sigma']**2
+        print(row['sigma']**2, sigma_2)
+        sigma_kernel = np.sqrt(sigma_kernel_2)
+        with_noise = file + np.random.normal(loc=0, scale=sigma_kernel, size=file.shape)
+        yield (np.expand_dims(file, -1), np.expand_dims(with_noise, -1), [filepath])
+
+def data_augment_2(images, kwargs_data):
+
+    metadata_filepath = kwargs_data.get('metadata_filepath', None)
+    exposure_col = kwargs_data.get('exposure_col', None)
+    name_col = kwargs_data.get("name_col", None)
+    sigma_col = kwargs_data.get("sigma_col", None)
+    fit_data_filepath = kwargs_data.get('fit_data_filepath', None)
+    fit_data_cols = kwargs_data.get('fit_data_cols', None)
+    location_col = kwargs_data.get("location_col", None)
+    abs_mean_col = kwargs_data.get("abs_mean_col", None)
+    samples = kwargs_data.get('samples', 5000)
+    steps = kwargs_data.get("steps", 100)
+    low = kwargs_data.get("low", 90)
+    high = kwargs_data.get('high', 15000)
+    training = kwargs_data.get('training', True)
+
+    columns_to_check = [
+        metadata_filepath,
+        exposure_col,
+        name_col,
+        sigma_col,
+        fit_data_filepath,
+        fit_data_cols, 
+        location_col,
+        abs_mean_col
+    ]
+
+    if any(col is None for col in columns_to_check):
+        raise Exception(f'One of the important parameters in the data arguments is None: {kwargs_data}. EXITING')
+    if not os.path.exists(metadata_filepath):
+        raise Exception(f'{metadata_filepath} does not exist. EXITING')
+    if not os.path.exists(fit_data_filepath):
+        raise Exception(f'{fit_data_filepath} does not exist. EXITING')
+    
+    df = pd.read_csv(metadata_filepath)
+    fit_data = pd.read_csv(fit_data_filepath)
+    
+    if set(fit_data.columns) != set(fit_data_cols):
+        raise Exception(f'{fit_data.columns} are not the required columns for the approximation: {fit_data_cols}')
+    if exposure_col not in df or name_col not in df or sigma_col not in df:
+        raise Exception(f'{exposure_col} or {name_col} or {sigma_col} not in the metadata. EXITING')
+    
+    info = []
+    for index, row in df.iterrows():
+        exp = row[exposure_col]
+        while True:
+            exp -= steps
+            if  exp > low and exp < high:
+                info.append({'name' : row[name_col], 'exp_time' : exp, 'sigma' : row[sigma_col], 'location':row[location_col], 'abs_mean':row[abs_mean_col]})
+            else:
+                break
+    info = pd.DataFrame(info)
+    info = info.dropna(subset=['sigma', 'exp_time', 'location', 'name', 'abs_mean'])
+    info = info[(info['sigma'] != 0) | (info['exp_time'] != 0)]
+    info['sigma'] = info['sigma'].abs()
+    info['exp_time'] = info['exp_time'].abs()
+
+    if training:
+        info = info[info['location'].apply(lambda x: 'training' in str(x) if pd.notnull(x) else False)]
+    else:
+        info = info[info['location'].apply(lambda x: 'eval' in str(x) if pd.notnull(x) else False)]
+    info.reset_index(inplace=True, drop=True)
+    
+    if len(info) and samples > len(info):
+        x = len(info)
+    elif len(info):
+        x = samples
+    else:
+        raise Exception(f'no adaquate sampling is possible')
+    
+    info = info.sample(frac=1).reset_index(drop=True)
+    info.sort_values(by='abs_mean', ascending=False, inplace=True)
+    sampled = info.head(x).reset_index(drop=True)
+    sampled = sampled.sample(frac=1).reset_index(drop=True)
+    yield from prepare_data(sampled, fit_data, training)
+
+########################################################
+def augment_samples(sigma, lowest_power=-4, highest_power=2):
+    var = sigma**2
+    exponent = np.floor(np.log10(abs(var))).astype(int)
+    base = np.floor(var / (10.0**exponent))
+    variances = []
+    if lowest_power <= exponent <= highest_power:
+        for x in range(exponent, highest_power + 1):
+            if x == exponent:
+                base_ = base
+            else:
+                base_ = 9
+
+            for b in range(1, int(base_)):
+                variances.append(b * 10**x)
+    return variances
+
+def prepare_data_2(sampled_data, training):
+    names = sampled_data['name'].tolist()
+    data = {}
+    for index, row in sampled_data.iterrows():
+        names.pop(0)
+        filepath = row['name']
+        file = None
+        if filepath in data:
+            file = data[filepath]
+        else:
+            if training == False:
+                train_eval = 'eval'
+            else:
+                train_eval = 'training'
+
+            actual_filepath = f'{os.path.dirname(__file__)}/our_data/{train_eval}/{filepath}'
+            file = open_fits_2(actual_filepath)
+            if file is not None:
+                file = np.nan_to_num(file, nan=0)
+                if filepath in names:
+                    data[filepath] = file
+
+        sigma_kernel_2 = row['variance'] - row['sigma']**2 
+        if sigma_kernel_2 < 0:
+            print(row['sigma']**2, row['variance'], sigma_kernel_2)
+        sigma_kernel = np.sqrt(sigma_kernel_2)
+        with_noise = file + np.random.normal(loc=0, scale=sigma_kernel, size=file.shape)
+        yield (np.expand_dims(file, -1), np.expand_dims(with_noise, -1), [filepath])
+
+def data_augment_3(images, kwargs_data):
+    metadata_filepath = kwargs_data.get('metadata_filepath', None)
+    exposure_col = kwargs_data.get('exposure_col', None)
+    name_col = kwargs_data.get("name_col", None)
+    sigma_col = kwargs_data.get("sigma_col", None)
+    location_col = kwargs_data.get("location_col", None)
+    abs_mean_col = kwargs_data.get("abs_mean_col", None)
+    samples = kwargs_data.get('samples', 5000)
+    low = kwargs_data.get("low", 90)
+    high = kwargs_data.get('high', 15000)
+    training = kwargs_data.get('training', True)
+    lowest_power = kwargs_data.get('lowest_power', -4)
+    highest_power = kwargs_data.get('highest_power', 2)
+
+    columns_to_check = [
+        metadata_filepath,
+        exposure_col,
+        name_col,
+        sigma_col,
+        location_col,
+        abs_mean_col
+    ]
+
+    if any(col is None for col in columns_to_check):
+        raise Exception(f'One of the important parameters in the data arguments is None: {kwargs_data}. EXITING')
+    if not os.path.exists(metadata_filepath):
+        raise Exception(f'{metadata_filepath} does not exist. EXITING')
+    
+    df = pd.read_csv(metadata_filepath)
+    
+    if exposure_col not in df or name_col not in df or sigma_col not in df:
+        raise Exception(f'{exposure_col} or {name_col} or {sigma_col} not in the metadata. EXITING')
+    
+    info = []
+    for index, row in df.iterrows():
+        exp = row[exposure_col]
+        if  exp > low and exp < high:
+            variances = augment_samples(row[sigma_col], lowest_power=lowest_power, highest_power=highest_power)
+            for var in variances:
+                info.append({'name' : row[name_col], 'variance' : var, 'sigma': row[sigma_col], 'location':row[location_col], 'abs_mean':row[abs_mean_col]})
+        else:
+            continue
+    info = pd.DataFrame(info)
+    info = info.dropna(subset=['sigma', 'variance', 'location', 'name', 'abs_mean'])
+    info = info[(info['variance'] != 0) | (info['sigma'] != 0)]
+    info['variance'] = info['variance'].abs()
+    info['sigma'] = info['sigma'].abs()
+
+    if training:
+        info = info[info['location'].apply(lambda x: 'training' in str(x) if pd.notnull(x) else False)]
+    else:
+        info = info[info['location'].apply(lambda x: 'eval' in str(x) if pd.notnull(x) else False)]
+    info.reset_index(inplace=True, drop=True)
+    info = info[info['variance'] >= info['sigma']**2]
+    
+    if len(info) and samples > len(info):
+        x = len(info)
+    elif len(info):
+        x = samples
+    else:
+        raise Exception(f'no adaquate sampling is possible')
+    
+    info = info.sample(frac=1).reset_index(drop=True)
+    info.sort_values(by='abs_mean', ascending=False, inplace=True)
+    sampled = info.head(x).reset_index(drop=True)
+    sampled = sampled.sample(frac=1).reset_index(drop=True)
+    yield from prepare_data_2(sampled, training)
+    
 def create_tf_dataset(images, sample_generator, generator_kwargs, batch_size=32):
     """
     Creates a TensorFlow Dataset from the data_augment generator with optimized parallelization.
@@ -394,18 +636,19 @@ def train_network(input_shape, folder, n_epochs, kwargs_data, kwargs_network, da
     if os.path.exists(folder):
         os.chdir(folder)
     else:
-        raise FileNotFoundError(f'No directory: {folder}')
+        os.makedirs(folder, exist_ok=True)
     if not callable(G_loss_fn):
         raise ValueError("The 'G_loss_fn' must be callable.")
     
     #Reading the imge filepaths from files residing in the respective folders
-    training_path = f'{os.getcwd()}/training'
-    eval_path = f'{os.getcwd()}/eval'
-    if os.path.exists(training_path):
+
+    training_path = kwargs_data.get("training_path", None)
+    eval_path = kwargs_data.get("eval_path", None)
+    if training_path is not None and os.path.exists(training_path):
         train_data = [f'{training_path}/{f}' for f in os.listdir(training_path) if f.endswith('.fits')]
     else:
         raise FileNotFoundError(f'No file at: {training_path}')
-    if os.path.exists(eval_path):
+    if eval_path is not None and os.path.exists(eval_path):
         eval_data = [f'{eval_path}/{f}' for f in os.listdir(eval_path) if f.endswith('.fits')]
     else:
         raise FileNotFoundError(f'No file at: {eval_path}')
@@ -436,6 +679,12 @@ def train_network(input_shape, folder, n_epochs, kwargs_data, kwargs_network, da
         model, start_epoch = result
     model.compile(optimizer=optimizer, loss=G_loss_fn)
     
+    if 'training' in kwargs_data:
+        kwargs_val = dict(kwargs_data)
+        kwargs_val['training'] = False
+    else:
+        kwargs_val = kwargs_data
+
     callback = Callback(
         dataset= train_dataset,
         dataset_size= sum(1 for _ in train_dataset) * batch_size,
@@ -445,7 +694,7 @@ def train_network(input_shape, folder, n_epochs, kwargs_data, kwargs_network, da
         period_save=period_save,  
         save_freq=save_freq,  
         sample_generator=data_generator,
-        kwargs_validation=kwargs_data,
+        kwargs_validation=kwargs_val,
         validation_images = eval_data,
         optimizer=optimizer,
         change_learning_rate=change_learning_rate
@@ -473,8 +722,44 @@ def __main__():
         'low' : 60,
         'high' : 10000,
         'start' : 2,
-        'stop' : 6
+        'stop' : 6,
+        'training_path' :f'{os.path.dirname(__file__)}/original_dataset/training',
+        'eval_path' :f'{os.path.dirname(__file__)}/original_dataset/eval'
     }
+    kwargs_data_2 = {
+        'metadata_filepath' : f'{os.path.dirname(__file__)}/our_data/cropped_images_stats.csv',
+        'exposure_col' : 'sci_actual_duration', 
+        'name_col' : 'filename',
+        'sigma_col' : 'org_std',
+        'fit_data_filepath' : f'{os.path.dirname(__file__)}/our_data/fit_info.csv',
+        'fit_data_cols' : ['t', 'a', 'dt', 'da'],
+        'samples' : 1000,
+        'steps' : 100,
+        'low' : 90, 
+        'high' : 15000,
+        'location_col' : 'location',
+        'abs_mean_col' : 'abs_mean',
+        'training_path' :f'{os.path.dirname(__file__)}/our_data/training',
+        'eval_path' :f'{os.path.dirname(__file__)}/our_data/eval'
+    }
+
+    kwargs_data_3 = {
+        'metadata_filepath' : f'{os.path.dirname(__file__)}/our_data/cropped_images_stats.csv',
+        'exposure_col' : 'sci_actual_duration', 
+        'name_col' : 'filename',
+        'sigma_col' : 'org_std',
+        'samples' : 1000,
+        'low' : 90, 
+        'high' : 15000,
+        'location_col' : 'location',
+        'abs_mean_col' : 'abs_mean',
+        'training_path' :f'{os.path.dirname(__file__)}/our_data/training',
+        'eval_path' :f'{os.path.dirname(__file__)}/our_data/eval',
+        'lowest_power' : -4,
+        'highest_power' : 2
+    }
+
+
     kwargs_network = {
         'depth':5,
         'kernel_size':3,
@@ -488,16 +773,16 @@ def __main__():
     }
 
     input_shape = (256, 256, 1)
-    folder = './original_dataset'
-    batch_size = 4
+    folder = './new_dataset'
+    batch_size = 32
     n_epochs = 10
     network_name='model'
     optimizer=Adam
-    change_learning_rate=[(0, 1e-4), (1, 1e-5)]
+    change_learning_rate=[(0, 1e-4), (1000, 1e-5)]
     G_loss_fn=MeanAbsoluteError()
-    start_from_scratch=False
-    start_from_best=False
-    start_from_last=True
+    start_from_scratch=True
+    start_from_best=True
+    start_from_last=False
     save_freq=1
     eval_percent=1
     period_save=1
@@ -506,8 +791,8 @@ def __main__():
     os.chdir(directory_path)
 
     logging.warning(f"Num GPUs Available: {len(tf.config.experimental.list_physical_devices('GPU'))}")
-    train_network(input_shape, folder, n_epochs, kwargs_data, kwargs_network,
-                  data_generator=data_augment, batch_size=batch_size,
+    train_network(input_shape, folder, n_epochs, kwargs_data_3, kwargs_network,
+                  data_generator=data_augment_3, batch_size=batch_size,
                   network_name=network_name,
                   optimizer=optimizer,change_learning_rate=change_learning_rate,
                   G_loss_fn=G_loss_fn, start_from_scratch=start_from_scratch,
