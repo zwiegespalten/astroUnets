@@ -70,6 +70,23 @@ def open_fits(filepath, type_of_image='SCI'):
     except Exception as err:
         logging.warning(f'Error occurred while reading the .fits file: {err}')
         return None
+
+def masked_open_fits(filepath):
+    try:
+        with fits.open(filepath) as f:
+            out = None
+            
+            for hdu in f:
+                if isinstance(hdu, (fits.PrimaryHDU, fits.ImageHDU, fits.CompImageHDU)) and isinstance(hdu.data, np.ndarray):
+                    out = hdu.data
+                    break
+            
+            if out is None:
+                return None
+            return out, filepath
+    except Exception as e:
+        print(f"Error reading {filepath}: {e}")
+        return None
     
 def filter_out_metadata(filepath, col, exp_column, allowed_survey, size=1000, low=100, high=10000, seed=42):
     if not os.path.exists(filepath):
@@ -177,8 +194,7 @@ def process_image_cropping(file, dir_, ps=256, type_of_image='SCI'):
         return 
     img, filepath, ex_time = img
     save_dir = os.path.join('./', dir_)
-    for result in crop_image(img, file, save_dir, ps=ps):
-        pass
+    crop_image(img, file, save_dir, ps=ps)
     return 
 
 def calculate_image_stats(data: np.ndarray, sigma: float = 3.0, nsigma: float = 2.0, 
@@ -195,34 +211,51 @@ def calculate_image_stats(data: np.ndarray, sigma: float = 3.0, nsigma: float = 
         tuple: A tuple containing (mean, median, std) of the background.
     """
     if data is None:
-        
         return
     
     try:
+        abs_mean = np.mean(data)
         sigma_clip = SigmaClip(sigma=sigma, maxiters=maxiters)
         threshold = detect_threshold(data, nsigma=nsigma, sigma_clip=sigma_clip)
         segment_img = detect_sources(data, threshold, npixels=npixels)
         footprint = circular_footprint(radius=footprint_radius)
         mask = segment_img.make_source_mask(footprint=footprint)
+        mask = ~mask
         mean, median, std = sigma_clipped_stats(data, sigma=sigma, mask=mask)
-        return (mean, median, std), mask
+        return (mean, median, std, abs_mean), np.array(mask).reshape(data.shape)
     except Exception as err:
         ##logging.warning(f'an error occurred while masking the light source: {err}')
-        return (np.nan, np.nan, np.nan), np.zeros(data.shape)
+        return (np.nan, np.nan, np.nan, np.nan), np.zeros(data.shape)
     
 def process_image_stats(file, type_of_image='SCI', sigma=3, nsigma=2, npixels=10, footprint_radius=10, maxiters=10, save=False):
     img = open_fits(file, type_of_image)
     if img is None:
         return 
     img, filepath, ex_time = img
-    (mean, median, std), mask = result = calculate_image_stats(img, sigma, nsigma, npixels, footprint_radius,  maxiters)
-    (mean, median, std), mask = result
+    img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
+    (mean, median, std, abs_mean), mask = calculate_image_stats(img, sigma, nsigma, npixels, footprint_radius,  maxiters)
     if save and not np.all(np.isnan(mask)):
         dir_ = os.path.dirname(file)
         masked_path = os.path.join(dir_, 'masked_images')
         create_dir(masked_path)
-        save_fits(mask, f'masked_{os.path.basename(file)}', masked_path + '/')
-    return {'filename':os.path.basename(file), 'mean':mean, 'median':median, 'std':std}
+        save_fits(img[mask], f'masked_{os.path.basename(file)}', masked_path + '/')
+    return {'filename':os.path.basename(file), 'location':file, 'mean':mean, 'median':median, 'std':std, 'abs_mean':abs_mean}
+
+def masked_process_image_stats(file, type_of_image='SCI', sigma=3, nsigma=2, npixels=10, footprint_radius=10, maxiters=10, save=False):
+    dir_ = os.path.dirname(file)
+    masked_path = os.path.join(dir_, 'masked_images')
+    if not os.path.exists(masked_path):
+        create_dir(masked_path)
+
+    img = masked_open_fits(file)
+    if img is None:
+        return 
+    img, filepath = img
+    img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
+    (mean, median, std, abs_mean), mask = calculate_image_stats(img, sigma, nsigma, npixels, footprint_radius,  maxiters)
+    if save and not np.all(np.isnan(mask)):
+        save_fits(img[mask], f'masked_{os.path.basename(file)}', masked_path + '/')
+    return {'filename':os.path.basename(file), 'location':file, 'mean':mean, 'median':median, 'std':std, 'abs_mean':abs_mean}
 
 def control_flow(dataset_dir, filepath, survey_column, exp_column, id_column, url_column, allowed_survey, download=False, masking=True,
                  masking_cropped=False, save=True, size=1000, low=100, high=1000, seed=42, split=(60, 20, 20), max_requests=5, reset_after=10,
@@ -265,6 +298,7 @@ def control_flow(dataset_dir, filepath, survey_column, exp_column, id_column, ur
                     if future is not None:
                         future.result()
 
+    noisy_filtered_metadata_output_file = './metadata_filepath_enriched_with_noise.csv'
     if masking:
         noise_attributes = []
         cropped_image_attributes = []
@@ -284,14 +318,13 @@ def control_flow(dataset_dir, filepath, survey_column, exp_column, id_column, ur
                             noise_attributes.append(result)
 
             if masking_cropped:
-                
+                print(folder)
                 if not os.path.exists(folder):
                     continue
 
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = [executor.submit(process_image_stats, file, type_of_image, sigma, nsigma, npixels, footprint_radius, maxiters)
+                    futures = [executor.submit(masked_process_image_stats, file, type_of_image, sigma, nsigma, npixels, footprint_radius, maxiters)
                             for file in [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith('.fits')]]
-                    
                     for future in as_completed(futures):
                         if future is not None:
                             result = future.result()
@@ -300,12 +333,30 @@ def control_flow(dataset_dir, filepath, survey_column, exp_column, id_column, ur
 
         noise_attributes = pd.DataFrame(noise_attributes)
         filtered_metadata = pd.read_csv(output_filtered_metadata_filename)
-        filtered_metadata.to_csv('./metadata_filepath_enriched_with_noise.csv', index=False)
         filtered_metadata['filename'] = filtered_metadata[url_column].apply(lambda url:  url.split('%2F')[-1])
         filtered_metadata = filtered_metadata.merge(noise_attributes, on='filename', how='left')
+        filtered_metadata.to_csv(noisy_filtered_metadata_output_file, index=False)
 
     if masking_cropped:
+        # Load cropped image attributes
         cropped_image_attributes = pd.DataFrame(cropped_image_attributes)
+        cropped_image_attributes['original_filename'] = cropped_image_attributes['filename'].apply(lambda x: x.split('_')[0] + '_drz.fits')
+
+        # Load filtered metadata and extract original_filename
+        filtered_metadata = pd.read_csv(output_filtered_metadata_filename)
+        filtered_metadata['original_filename'] = filtered_metadata[url_column].apply(lambda url: url.split('%2F')[-1])
+
+        # Load noisy filtered metadata, extract original_filename, and rename columns
+        noisy_filtered_metadata = pd.read_csv(noisy_filtered_metadata_output_file)
+        noisy_filtered_metadata['original_filename'] = noisy_filtered_metadata[url_column].apply(lambda url: url.split('%2F')[-1])
+        noisy_filtered_metadata = noisy_filtered_metadata[['original_filename', 'mean', 'median', 'std']]
+        noisy_filtered_metadata.rename(columns={'mean': 'org_mean', 'median': 'org_median', 'std': 'org_std'}, inplace=True)
+
+        # Merge datasets
+        cropped_image_attributes = filtered_metadata.merge(cropped_image_attributes, on='original_filename', how='left')
+        cropped_image_attributes = cropped_image_attributes.merge(noisy_filtered_metadata, on='original_filename', how='left')
+
+        # Save the final result
         cropped_image_attributes.to_csv('./cropped_images_stats.csv', index=False)
 
 def main():

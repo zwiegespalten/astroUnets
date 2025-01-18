@@ -3,6 +3,7 @@ import threading
 import random
 from queue import Queue
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import MeanAbsoluteError
