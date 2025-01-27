@@ -23,11 +23,11 @@ def linear_function(x, a, b):
     return a * x + b
 
 # Filter the data to remove outliers
-#Q1 = grouped['mean_variance'].quantile(0.25)
-#Q3 = grouped['mean_variance'].quantile(0.75)
-#IQR = Q3 - Q1
-#filtered_data = grouped[(grouped['mean_variance'] >= Q1 - 1.5 * IQR) & (grouped['mean_variance'] <= Q3 + 1.5 * IQR)]
-filtered_data = grouped
+Q1 = grouped['mean_variance'].quantile(0.25)
+Q3 = grouped['mean_variance'].quantile(0.75)
+IQR = Q3 - Q1
+filtered_data = grouped[(grouped['mean_variance'] >= Q1 - 1.0 * IQR) & (grouped['mean_variance'] <= Q3 + 1.0 * IQR)]
+#filtered_data = grouped
 # Ensure there is data to fit
 if len(filtered_data) > 0:
     exposure_time_filtered = filtered_data['sci_actual_duration'].values
@@ -78,8 +78,6 @@ if len(filtered_data) > 0:
         color='red',
         label=f'Fit: Linearized Power Law (χ²_red={chi_squared_reduced:.2f})'
     )
-    plt.legend()
-    plt.show()
     functions = [
         ("Linearized Power Law", linear_function, [-0.9, 0.1])
     ]
@@ -118,9 +116,9 @@ for label, func, initial_guess in functions:
     except Exception as e:
         print(f"Error fitting {label}: {e}")
 
-# Customize the plot
-plt.legend(loc='upper right')
-plt.title('Log-Log Fit of Exposure Time vs Variance')
-plt.grid()
-plt.savefig(f'{os.path.dirname(__file__)}/our_data/fit.png', dpi=96)
-plt.show()
+    # Customize the plot
+    plt.legend(loc='upper right')
+    plt.title('Log-Log Fit of Exposure Time vs Variance')
+    plt.grid()
+    plt.savefig(f'{os.path.dirname(__file__)}/our_data/fit.png', dpi=96)
+    plt.show()
