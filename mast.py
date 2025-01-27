@@ -24,6 +24,30 @@ START = False
 LOCK = asyncio.Lock()
 
 def filter_out_mast(mission, filters):
+    """
+    Retrieves and filters metadata from the MAST (Mikulski Archive for Space Telescopes) based on specified mission 
+    and filter criteria. It queries the MAST API to return relevant metadata, handles pagination, and returns the 
+    result as a pandas DataFrame.
+
+    Parameters:
+        mission (str): The name of the space mission (e.g., 'HST', 'TESS') to query metadata from.
+        filters (dict): A dictionary containing filter criteria where keys are column names and values are filter values.
+
+    Returns:
+        pd.DataFrame: A pandas DataFrame containing the filtered metadata retrieved from the MAST archive. 
+                      Returns None if there is an error or no data is found.
+
+    Notes:
+        - The function uses pagination to handle cases where the number of results exceeds the API limit.
+        - The filter criteria must match column names available for the specified mission.
+        - If no filters are provided, all metadata from the specified mission will be returned.
+        - The function uses the `MastMissions` class to query MAST and convert the result into a pandas DataFrame.
+
+    Example:
+        filters = {'target_name': 'HD 12345', 'observation_type': 'science'}
+        metadata = filter_out_mast('TESS', filters)
+    """
+
     kwargs = {}
     length = 1
     offset = 0
@@ -69,7 +93,33 @@ def filter_out_mast(mission, filters):
         return None
     
 def plot_histogram(data, bins=20, label=None, xlabel='Exposure Time (s)', ylabel='Frequency', title='Histogram of Exposure', output_filename='histogram.png',loc='upper left', c='b', rotation=60):
+    """
+    Plots a histogram of the given data and saves it as an image file. The histogram is plotted with statistical 
+    information, including mean, median, standard deviation, and variance.
 
+    Parameters:
+        data (array-like): Input data to be plotted as a histogram.
+        bins (int, optional): Number of bins in the histogram. Default is 20.
+        label (str, optional): Label for the histogram. If None, the label is automatically generated with statistical information. Default is None.
+        xlabel (str, optional): Label for the x-axis. Default is 'Exposure Time (s)'.
+        ylabel (str, optional): Label for the y-axis. Default is 'Frequency'.
+        title (str, optional): Title of the plot. Default is 'Histogram of Exposure'.
+        output_filename (str, optional): The name of the output image file where the histogram will be saved. Default is 'histogram.png'.
+        loc (str, optional): Location for the legend. Default is 'upper left'.
+        c (str, optional): Color for the histogram bars. Default is 'b' (blue).
+        rotation (int, optional): Rotation angle for the x-axis labels. Default is 60.
+
+    Returns:
+        None: The function saves the plot as an image and displays it. It does not return any value.
+
+    Notes:
+        - The histogram is displayed on a logarithmic scale for the y-axis.
+        - Vertical lines are drawn to indicate the mean (red) and median (purple) of the data.
+        - The plot is saved as a PNG file with a resolution of 300 dpi.
+
+    Example:
+        plot_histogram(data, bins=30, xlabel='Magnitude', ylabel='Count', title='Histogram of Magnitudes', output_filename='mag_histogram.png')
+    """
     # Calculate statistics
     mean = data.mean()
     median = data.median()
@@ -97,6 +147,29 @@ def plot_histogram(data, bins=20, label=None, xlabel='Exposure Time (s)', ylabel
     plt.show()
 
 async def download_image(id_, url, save_dir, session, semaphore, filename):
+    """
+    Downloads an image from a given URL asynchronously and saves it to the specified directory.
+
+    Parameters:
+        id_ (str): The unique identifier for the image.
+        url (str): The URL from which the image will be downloaded.
+        save_dir (str): The directory where the image will be saved.
+        session (aiohttp.ClientSession, optional): The session used to make the HTTP request. If not provided, a new session is created.
+        semaphore (asyncio.Semaphore): A semaphore to control concurrency and prevent overloading the server.
+        filename (str): The name of the file under which the image will be saved.
+
+    Returns:
+        bool: Returns `True` if the image was successfully downloaded and saved, `False` otherwise.
+
+    Notes:
+        - The function uses `aiohttp` for asynchronous HTTP requests with a timeout of 15 seconds.
+        - If the image is successfully retrieved, it is saved as a FITS file.
+        - The function handles exceptions and logs warnings if errors occur during the download.
+        - A semaphore is used to limit the number of concurrent downloads.
+        
+    Example:
+        await download_image(id_, url, save_dir, session, semaphore, filename)
+    """
     async with semaphore:
         try:
             if not session:
@@ -118,6 +191,28 @@ async def download_image(id_, url, save_dir, session, semaphore, filename):
         return False
 
 async def download_images(ids, urls, save_dir, max_requests=5, reset_after=10):
+    """
+    Downloads multiple images from a list of URLs asynchronously and saves them to the specified directory.
+
+    Parameters:
+        ids (iterable): A list or iterable of unique identifiers for each image.
+        urls (iterable): A list or iterable of URLs pointing to the images to be downloaded.
+        save_dir (str): The directory where the downloaded images will be saved.
+        max_requests (int, optional): The maximum number of concurrent download requests. Defaults to 5.
+        reset_after (int, optional): The number of requests after which the session should be reset. Defaults to 10.
+
+    Returns:
+        bool: Returns `True` if all images were successfully downloaded, `False` if any download failed, or `None` if an error occurred.
+
+    Notes:
+        - The function uses `aiohttp` for asynchronous HTTP requests with a timeout of 15 seconds.
+        - After every `reset_after` requests, the session is closed and reopened to avoid potential connection issues.
+        - The images are saved as FITS files using the `download_image` function.
+        - Any invalid URLs (e.g., `NaN` values) are skipped without causing an error.
+
+    Example:
+        await download_images(ids, urls, save_dir, max_requests=10, reset_after=15)
+    """
     semaphore = asyncio.Semaphore(max_requests)
     # Use a session reset mechanism
     session = None
@@ -141,6 +236,24 @@ async def download_images(ids, urls, save_dir, max_requests=5, reset_after=10):
     return None
     
 async def generate_urls(product_identifier):
+    """
+    Generates a list of URLs for downloading FITS files based on the given product identifier.
+
+    Parameters:
+        product_identifier (str): A product identifier (typically a string representing the base part of the filename, excluding the last 3 characters).
+    Returns:
+        list: A list of URLs to retrieve the corresponding FITS files for different permutations of characters.
+    Notes:
+        - The function generates URLs by appending permutations of two characters from a predefined character set to the base product identifier.
+        - Each generated URL points to a product on the Hubble Space Telescope's MAST (Mikulski Archive for Space Telescopes).
+        - The resulting URLs follow the pattern:
+          `https://mast.stsci.edu/search/hst/api/v0.1/retrieve_product?product_name={product_identifier}%2F{base_part}{perm}q_raw.fits`
+        - If an error occurs during the URL generation process, it logs the error and returns `None`.
+
+    Example:
+        urls = await generate_urls('HST-12345')
+    """
+
     char_set = '0123456789abcdefghijklmnopqrstuvwxyz'
     try:
         base_part = product_identifier[:-3].lower()
@@ -162,6 +275,34 @@ async def generate_urls(product_identifier):
         return None
 
 async def process_url(lock, table, column, url_column, id_, url, save_dir, session, semaphore, download=False):
+    """
+    Processes a URL to either update a DataFrame with the URL or download the corresponding file, depending on the 'download' flag.
+
+    Parameters:
+        lock (asyncio.Lock): A lock to ensure thread-safe access to shared resources (used for modifying the DataFrame).
+        table (pandas.DataFrame): The DataFrame containing metadata where the URL is stored.
+        column (str): The column name in the DataFrame used to find the row corresponding to 'id_'.
+        url_column (str): The column name in the DataFrame where the URL is to be stored.
+        id_ (str): The identifier used to locate the row in the DataFrame to update with the URL.
+        url (str): The URL to process (download or store in the DataFrame).
+        save_dir (str): Directory where the downloaded file will be saved, if 'download' is True.
+        session (aiohttp.ClientSession): The active session to be used for making HTTP requests. If not provided, a new session will be created.
+        semaphore (asyncio.Semaphore): Semaphore to limit the number of concurrent download requests.
+        download (bool): A flag to indicate whether the file should be downloaded (`True`), or just the URL should be stored (`False`).
+
+    Returns:
+        str or None: Returns the URL if successful, or None if there was an error during processing.
+
+    Notes:
+        - The function checks if the URL request returns a successful status (HTTP 200).
+        - If `download` is `True`, the content is downloaded and saved as a FITS file in the specified `save_dir`.
+        - The `table` is updated with the `url_column` corresponding to the `id_` if the download or URL update is successful.
+        - An asyncio lock (`lock`) is used to prevent race conditions when modifying the DataFrame.
+        - If an error occurs during the request or processing, it logs the error and returns `None`.
+
+    Example:
+        url = await process_url(lock, df, 'id', 'url', 'product123', 'http://example.com/file', './downloads', session, semaphore, download=True)
+    """
     async with semaphore:
         try:
             if not session:
@@ -190,6 +331,37 @@ async def process_url(lock, table, column, url_column, id_, url, save_dir, sessi
         return None
 
 async def process_urls(table, id_, lock, save_dir, column, url_column, max_requests=5, reset_after=10, download=False):
+    """
+    Processes multiple URLs associated with a product identifier, attempting to retrieve and download the corresponding file or update the DataFrame with the URL.
+
+    This function generates URLs for a given `id_`, processes them one by one, and updates the provided `table` DataFrame with the first successful URL. 
+    It optionally downloads the corresponding FITS file if `download` is set to True. A session reset mechanism is used to ensure a fresh session is used periodically.
+
+    Parameters:
+        table (pandas.DataFrame): The DataFrame containing metadata where the URL is stored.
+        id_ (str): The product identifier for which URLs will be generated and processed.
+        lock (asyncio.Lock): A lock to ensure thread-safe access to shared resources (used for modifying the DataFrame).
+        save_dir (str): Directory where the downloaded file will be saved, if 'download' is True.
+        column (str): The column name in the DataFrame used to find the row corresponding to 'id_'.
+        url_column (str): The column name in the DataFrame where the URL is to be stored.
+        max_requests (int, optional): The maximum number of concurrent requests allowed. Default is 5.
+        reset_after (int, optional): The number of requests to make before resetting the session. Default is 10.
+        download (bool, optional): A flag to indicate whether the file should be downloaded (`True`), or just the URL should be stored (`False`).
+
+    Returns:
+        str or None: Returns the first successfully processed URL if found, or None if no URLs were successfully processed or if there was an error.
+
+    Notes:
+        - The function generates a list of URLs using `generate_urls` based on the `id_`.
+        - A semaphore limits the number of concurrent requests to avoid overloading the server.
+        - The function uses a session reset mechanism, where the session is closed and reopened after a certain number of requests (`reset_after`).
+        - If `download` is `True`, the corresponding FITS file is downloaded and saved in the `save_dir`.
+        - A lock (`lock`) is used to ensure safe concurrent updates to the DataFrame.
+        - If an error occurs during the URL processing, the function logs the error and returns `None`.
+
+    Example:
+        result = await process_urls(df, 'product123', lock, './downloads', 'id', 'url', max_requests=5, download=True)
+    """
     semaphore = asyncio.Semaphore(max_requests)
     url_generator = await generate_urls(id_)
     result = None
@@ -221,11 +393,70 @@ async def process_urls(table, id_, lock, save_dir, column, url_column, max_reque
     return None
 
 def wrap_process_urls(table, id_, lock, save_dir, column, url_column, max_requests=10000, reset_after=5, download=False):
+    """
+    A wrapper function to run the asynchronous `process_urls` function in a synchronous context.
+
+    This function creates a new event loop and runs the `process_urls` function until it completes.
+    It is useful when you need to call an asynchronous function from synchronous code (e.g., in a non-async environment).
+
+    Parameters:
+        table (pandas.DataFrame): The DataFrame containing metadata where the URL will be stored.
+        id_ (str): The product identifier for which URLs will be generated and processed.
+        lock (asyncio.Lock): A lock to ensure thread-safe access to shared resources (used for modifying the DataFrame).
+        save_dir (str): Directory where the downloaded file will be saved, if 'download' is True.
+        column (str): The column name in the DataFrame used to find the row corresponding to 'id_'.
+        url_column (str): The column name in the DataFrame where the URL is to be stored.
+        max_requests (int, optional): The maximum number of concurrent requests allowed. Default is 10000.
+        reset_after (int, optional): The number of requests to make before resetting the session. Default is 5.
+        download (bool, optional): A flag to indicate whether the file should be downloaded (`True`), or just the URL should be stored (`False`).
+
+    Returns:
+        str or None: Returns the first successfully processed URL if found, or None if no URLs were successfully processed or if there was an error.
+
+    Notes:
+        - This function is a wrapper for the asynchronous `process_urls` function, allowing it to be called from synchronous code.
+        - A new event loop is created and set for the current thread, which is then used to run the `process_urls` function.
+        - All parameters of the wrapped `process_urls` function are passed along to `process_urls`.
+
+    Example:
+        result = wrap_process_urls(df, 'product123', lock, './downloads', 'id', 'url', max_requests=5, download=True)
+    """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     return loop.run_until_complete(process_urls(table, id_,lock, save_dir, column, url_column, max_requests, reset_after, download))
 
 def request_and_save(table, column, url_column, save_dir, output_name, max_requests=10000, reset_after=5, max_workers=16, download=False, period=60, step=10):
+    """
+    Processes a table by fetching URLs (and optionally downloading files) in parallel and periodically saving the table to a CSV file.
+
+    This function runs a background thread that periodically saves the table to a CSV file while processing URLs asynchronously using a ThreadPoolExecutor. 
+    The function attempts to process each row in the DataFrame by generating and fetching URLs, updating the table with the results.
+
+    Parameters:
+        table (pandas.DataFrame): The DataFrame containing the data to process, with columns `column` and `url_column`.
+        column (str): The column name in the table that holds the product identifiers.
+        url_column (str): The column name in the table where the URLs will be stored after processing.
+        save_dir (str): Directory where any downloaded files will be saved (if `download` is `True`).
+        output_name (str): The name of the CSV file where the table will be saved periodically.
+        max_requests (int, optional): The maximum number of concurrent requests allowed. Default is 10000.
+        reset_after (int, optional): The number of requests to make before resetting the session. Default is 5.
+        max_workers (int, optional): The maximum number of parallel workers for processing URLs. Default is 16.
+        download (bool, optional): If `True`, download the files after processing the URLs. Default is `False`.
+        period (int, optional): The total time (in seconds) to wait before saving the table. Default is 60 seconds.
+        step (int, optional): The interval (in seconds) between each check for saving the table. Default is 10 seconds.
+
+    Returns:
+        pandas.DataFrame: The updated DataFrame with URLs processed and saved.
+
+    Notes:
+        - This function utilizes a background thread that saves the table periodically.
+        - It uses a `ThreadPoolExecutor` for parallel processing of URLs.
+        - The background thread stops once all URLs are processed or the `cond["flag"]` is set to `False`.
+        - The function assumes that the table's column specified in `column` contains product identifiers and the column specified in `url_column` will hold the resulting URLs.
+
+    Example:
+        updated_table = request_and_save(df, 'id', 'url', './downloads', 'output.csv', download=True)
+    """
     if column not in table or url_column not in table:
         return 
 
@@ -274,6 +505,37 @@ def request_and_save(table, column, url_column, save_dir, output_name, max_reque
     return table
 
 def update_file(input_filepath, column, url_column, save_dir, max_requests=10000, reset_after=5, max_workers=16, download=False, period=60, step=10):
+    """
+    Updates a CSV file by processing URLs for each entry and saving the table with the resulting URLs.
+
+    This function reads a CSV file from the specified `input_filepath`, processes the URLs (if not already processed), 
+    and updates the table with the processed URLs. It then saves the updated table back to the same file. 
+    The function uses `request_and_save` to fetch URLs and optionally download files.
+
+    Parameters:
+        input_filepath (str): The path to the input CSV file to be updated.
+        column (str): The column name in the CSV file that holds the product identifiers.
+        url_column (str): The column name in the CSV file where the URLs will be stored after processing.
+        save_dir (str): Directory where any downloaded files will be saved (if `download` is `True`).
+        max_requests (int, optional): The maximum number of concurrent requests allowed. Default is 10000.
+        reset_after (int, optional): The number of requests to make before resetting the session. Default is 5.
+        max_workers (int, optional): The maximum number of parallel workers for processing URLs. Default is 16.
+        download (bool, optional): If `True`, download the files after processing the URLs. Default is `False`.
+        period (int, optional): The total time (in seconds) to wait before saving the table. Default is 60 seconds.
+        step (int, optional): The interval (in seconds) between each check for saving the table. Default is 10 seconds.
+
+    Returns:
+        pandas.DataFrame: The updated DataFrame with URLs processed and saved to the input file.
+
+    Notes:
+        - If the `url_column` doesn't exist in the input file, it is created with `None` values for each row.
+        - The function calls `request_and_save` to process URLs and download files if needed.
+        - The table is periodically saved to the input file during processing.
+
+    Example:
+        updated_table = update_file('data.csv', 'id', 'url', './downloads', download=True)
+    """
+        
     if os.path.exists(input_filepath):
         df = pd.read_csv(input_filepath)
         if url_column not in df:
