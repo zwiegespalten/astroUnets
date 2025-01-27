@@ -441,7 +441,7 @@ def data_augment_2(images, kwargs_data):
 ########################################################
 def augment_samples(sigma, lowest_power=-4, highest_power=2):
     var = sigma**2
-    exponent = np.floor(np.log10(abs(var))).astype(int)
+        exponent = np.floor(np.log10(abs(var))).astype(int)
     base = np.floor(var / (10.0**exponent))
     variances = []
     if lowest_power <= exponent <= highest_power:
