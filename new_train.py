@@ -1,4 +1,4 @@
-import os, logging, time, shutil, json, re
+import os, logging, time, shutil, json, re, sys
 import random
 import numpy as np
 import pandas as pd
@@ -6,13 +6,14 @@ from scipy.signal import convolve2d
 import tensorflow as tf
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import MeanAbsoluteError
+#import tensorflow_addons as tfa
 from astropy.io import fits
 from network import network
 
 class Callback(tf.keras.callbacks.Callback):
     def __init__(self, dataset, dataset_size, epoch, start_epoch, eval_percent,
                  period_save, save_freq, sample_generator, kwargs_validation,
-                validation_images, optimizer, change_learning_rate):
+                validation_images, optimizer, change_learning_rate, batch_size, scaling):
         """
     Custom Keras callback for handling various training and validation tasks.
 
@@ -53,6 +54,8 @@ class Callback(tf.keras.callbacks.Callback):
         self.optimizer = optimizer
         self.change_learning_rate = change_learning_rate
         self.lr = 0
+        self.batch_size = batch_size
+        self.scaling = scaling
 
     def create_directory(self, path):
         """
@@ -105,6 +108,8 @@ class Callback(tf.keras.callbacks.Callback):
                 
         self.current_epoch += 1
         train_loss = logs.get('loss', 0) if logs else 0
+        #train_loss = train_loss / self.batch_size
+        train_loss = train_loss
         epoch_time = time.time() - self.epoch_start 
 
         # Save training images periodically
@@ -122,11 +127,46 @@ class Callback(tf.keras.callbacks.Callback):
                     for x_trains, y_trains, filepaths in batch:
                         predictions = self.model.predict(x_trains)
                         for x_train, y_train, prediction, filepath in zip(x_trains, y_trains, predictions, filepaths):
-                            filepath = filepath.numpy()[0].decode('utf-8') 
-                            sv_name = "/" + filepath.split('/')[-1][:-5]
-                            save_fits(y_train[:, :, 0], sv_name, result_path)
-                            save_fits(prediction, sv_name + "_output", result_path)
-                            save_fits(x_train[:, :, 0], sv_name + "_noise", result_path)
+                            filepath = np.array([fp.decode('utf-8') for fp in filepath.numpy()])  # Decode properly
+                            org_img = noise_img = prd_img = None
+                            if self.scaling == 'log_min_max' and len(filepath) == 7:
+                                filepath, org_min, org_max, org_shift, noise_min, noise_max, noise_shift = filepath
+                                org_min, org_max, org_shift = map(float, [org_min, org_max, org_shift])
+                                noise_min, noise_max, noise_shift = map(float, [noise_min, noise_max, noise_shift])
+
+                                sv_name = "/" + filepath.split('/')[-1][:-5]  # Extract filename
+                                org_img = inverse_adaptive_log_transform_and_denormalize(y_train[:, :, 0], org_min, org_max, org_shift)
+                                noise_img = inverse_adaptive_log_transform_and_denormalize(x_train[:, :, 0], noise_min, noise_max, noise_shift)
+                                prd_img = inverse_adaptive_log_transform_and_denormalize(prediction[:, :, 0], noise_min, noise_max, noise_shift)
+
+                            elif self.scaling == 'z_scale' and len(filepath) == 5:
+                                filepath, org_mean, org_std, noise_mean, noise_std = filepath
+                                org_mean, org_std = map(float, [org_mean, org_std])
+                                noise_mean, noise_std = map(float, [noise_mean, noise_std])
+
+                                sv_name = "/" + filepath.split('/')[-1][:-5]  # Extract filename
+                                org_img = inverse_zscore_normalization(y_train[:, :, 0], org_mean, org_std)
+                                noise_img = inverse_zscore_normalization(x_train[:, :, 0], noise_mean, noise_std)
+                                prd_img = inverse_zscore_normalization(prediction[:, :, 0], noise_mean, noise_std)
+                            elif self.scaling == 'min_max' and len(filepath) == 5:
+                                filepath, org_min, org_max, noise_min, noise_max = filepath
+                                org_min, org_max = map(float, [org_min, org_max])
+                                noise_min, noise_max = map(float, [noise_min, noise_max])
+
+                                sv_name = "/" + filepath.split('/')[-1][:-5]  # Extract filename
+                                org_img = inverse_min_max_normalization(y_train[:, :, 0], org_min, org_max)
+                                noise_img = inverse_min_max_normalization(x_train[:, :, 0], noise_min, noise_max)
+                                prd_img = inverse_min_max_normalization(prediction[:, :, 0], noise_min, noise_max)
+                            else:
+                                filepath = filepath[0]
+                                sv_name = "/" + filepath.split('/')[-1][:-5]
+                                org_img = y_train[:, :, 0]
+                                prd_img = prediction[:, :, 0]
+                                noise_img = x_train[:, :, 0]
+                            #if isinstance(org_img, np.ndarray) and isinstance(prd_img, np.ndarray) and isinstance(noise_img, np.ndarray):
+                            save_fits(org_img, sv_name, result_path)
+                            save_fits(prd_img, sv_name + "_output", result_path)
+                            save_fits(noise_img, sv_name + "_noise", result_path)
                             temp += 1
                     indices.add(index)
 
@@ -137,8 +177,8 @@ class Callback(tf.keras.callbacks.Callback):
                                      size=min(count, len(self.validation_images)))
         selected_images = np.array(self.validation_images)[indices]
         validation_data = create_tf_dataset(selected_images, self.sample_generator,
-                                                 generator_kwargs=self.kwargs_validation)
-
+                                                 generator_kwargs=self.kwargs_validation, 
+                                                 scaling=self.scaling)
         validation_loss = 0
         num_batches = 0
         for x_val, y_val, _ in validation_data:
@@ -146,7 +186,6 @@ class Callback(tf.keras.callbacks.Callback):
             loss_value = self.model.compiled_loss(y_val, predictions)
             validation_loss += float(loss_value)
             num_batches += 1
-
         avg_validation_loss = validation_loss / num_batches
 
         # Track best validation loss
@@ -460,7 +499,90 @@ def find_columns(columns, suffixes, n):
             filtered_columns.append(closest_column)
     
     return filtered_columns
+
+def find_distribution(df, col):
+    min_val = df[col].min()
+    max_val = df[col].max()
+
+    if min_val == 0:
+        exponent_min = 0
+    else:
+        exponent_min = np.floor(np.log10(abs(min_val))).astype(int)
+    if max_val == 0:
+        exponent_max = 0
+    else:
+        exponent_max = np.floor(np.log10(abs(max_val))).astype(int)
+
+    bases = np.linspace(1, 9, 9)
+    exponents = list(range(exponent_min, exponent_max + 1))
+    data = []
+    for exponent in exponents:
+        for base in bases:
+            start_value = base * 10.0 ** exponent
+            end_value = (base + 1) * 10.0 ** exponent
+            
+            filtered_df = df[(df[col] >= start_value) & (df[col] < end_value)]
+            
+            mean = filtered_df[col].mean() if not filtered_df.empty else np.nan
+            std = filtered_df[col].std() if not filtered_df.empty else np.nan
+            data.append({'base': int(base), 'exponent': int(exponent), 'mean': mean, 'std': std})
     
+    return pd.DataFrame(data)
+
+def find_distribution_only_exp(df, col):
+    min_val = df[col].min()
+    max_val = df[col].max()
+
+    if min_val == 0:
+        exponent_min = 0
+    else:
+        exponent_min = np.floor(np.log10(abs(min_val))).astype(int)
+    if max_val == 0:
+        exponent_max = 0
+    else:
+        exponent_max = np.floor(np.log10(abs(max_val))).astype(int)
+
+    exponents = list(range(exponent_min, exponent_max + 1))
+    data = []
+    for exponent in exponents:
+        start_value = 10.0 ** exponent
+        end_value = 10.0 ** (exponent+1)
+        
+        filtered_df = df[(df[col] >= start_value) & (df[col] < end_value)]
+        
+        mean = filtered_df[col].mean() if not filtered_df.empty else np.nan
+        std = filtered_df[col].std() if not filtered_df.empty else np.nan
+        data.append({'exponent': int(exponent), 'mean': mean, 'std': std})
+    
+    return pd.DataFrame(data)
+
+def apply_ranges(range_df, row):
+    sigma = abs(row['combined_sigma']) 
+    base = row['sigma_base']
+    exponent = row['sigma_exponent']
+
+    temp = range_df[(range_df['base'] == base) & (range_df['exponent'] == exponent)]
+    
+    if not temp.empty:
+        mean = temp['mean'].values[0]
+        std = temp['std'].values[0]
+
+        return mean - 3 * std <= sigma <= mean + 3 * std
+    return False 
+
+def apply_ranges_only_exponent(range_df, row):
+    sigma = abs(row['combined_sigma']) 
+    exponent = row['sigma_exponent']
+
+    temp = range_df[(range_df['exponent'] == exponent)]
+    
+    if not temp.empty:
+        mean = temp['mean'].values[0]
+        std = temp['std'].values[0]
+
+        return mean - 3 * std <= sigma <= mean + 3 * std
+    return False 
+
 #############CROPPING, NOISE ADDITION AND DATA AUGMENTATIONS###################################################
 ###############################################################################################################
 ###############################################################################################################
@@ -835,6 +957,7 @@ def data_augment_2(images, kwargs_data):
     location_col = kwargs_data.get("location_col", None)
     abs_mean_col = kwargs_data.get("abs_mean_col", None)
     samples = kwargs_data.get('samples', 5000)
+    val_samples = kwargs_data.get('val_samples', 5000)
     steps = kwargs_data.get("steps", 100)
     low = kwargs_data.get("low", 90)
     high = kwargs_data.get('high', 15000)
@@ -874,7 +997,8 @@ def data_augment_2(images, kwargs_data):
         while True:
             exp -= steps
             if  exp > low and exp < high:
-                info.append({'name' : row[name_col], 'exp_time' : exp, 'sigma' : row[sigma_col], 'location':row[location_col], 'abs_mean':row[abs_mean_col]})
+                info.append({'name' : row[name_col], 'exp_time' : exp, 'sigma' : row[sigma_col],
+                 'location':row[location_col], 'abs_mean':row[abs_mean_col]})
             else:
                 break
     info = pd.DataFrame(info)
@@ -903,7 +1027,50 @@ def data_augment_2(images, kwargs_data):
     yield from prepare_data(sampled, fit_data, training, data_folder)
 
 ######################WITHOUT FIT##################################
-########################################################
+###################SCALING#######################
+def min_max_normalization(data):
+    min_val, max_val = np.min(data), np.max(data)
+    if (max_val - min_val) == 0:
+        return None
+    return (data - min_val) / (max_val - min_val), min_val, max_val
+
+def inverse_min_max_normalization(normalized_data, min_val, max_val):
+    return (normalized_data * (max_val - min_val)) + min_val
+
+def zscore_normalization(data):
+    mean, std = np.mean(data), np.std(data)
+    if std == 0:
+        return None
+    return (data - mean) / std, mean, std
+
+def inverse_zscore_normalization(normalized_data, mean, std):
+    if std == 0:
+        return None
+    return (normalized_data * std) + mean
+
+def adaptive_log_transform_and_normalize(data):
+    # Shift to avoid negative values
+    min_data = np.min(data)
+    shift_value = -min_data + 1 if min_data < 0 else 1
+    log_data = np.log(data + shift_value)
+    # Min-Max normalization
+    min_val = np.min(log_data)
+    max_val = np.max(log_data)
+    # Prevent division by zero if min_val == max_val
+    if min_val == max_val:
+        return None, None, None, None
+    normalized_data = (log_data - min_val) / (max_val - min_val)
+    return normalized_data.astype(np.float32), min_val, max_val, shift_value
+
+def inverse_adaptive_log_transform_and_denormalize(predicted_data, original_min_val, original_max_val, shift_value):
+    if original_min_val is None or original_max_val is None:
+        return None
+    # Reverse Min-Max normalization
+    log_data = predicted_data * (original_max_val - original_min_val) + original_min_val
+    # Reverse log transformation
+    denormalized_data = np.exp(log_data) - shift_value
+    return denormalized_data.astype(np.float32)
+
 def is_relevant_crop(stats, delta=0.5):
     """
     Determines if a crop is considered relevant based on its absolute mean value relative to the original uncropped image.
@@ -936,7 +1103,7 @@ def is_relevant_crop(stats, delta=0.5):
     abs_threshold = abs_uncropped * delta
     return abs_crop > abs_threshold
 
-def filtering_df(data, n_samples, delta, id_, abs_, base, exponent):
+def filtering_df(data, n_samples, delta, id_, abs_, base, exponent, noise_ratio):
     """
     Filters and selects a subset of rows from a DataFrame based on relevance and specific sorting criteria.
     The main aim of the function is to guarantee a good selection. This is achieved first by grouping by dataset id
@@ -987,16 +1154,24 @@ def filtering_df(data, n_samples, delta, id_, abs_, base, exponent):
         - The resulting DataFrame is sorted by `abs_` in descending order, `base` and `exponent` are sorted according to
           their specified ascending/descending order.
     """
+    if n_samples >= len(data):
+        return data
+
     data['valid'] = data.apply(lambda row: is_relevant_crop(row, delta=delta), axis=1)
     data = data[data['valid']]
-    data['index'] = np.arange(0, len(data))
-    n_samples = min(n_samples, len(data))
+    if n_samples >= len(data):
+        return data
+    old_n_samples = n_samples
+    if len(data) >= 2*n_samples:
+        n_samples *= 2
+
+    data.loc[:, 'temp_index'] = np.arange(0, len(data))
     dfs = []
     already_in = 0
     while True:
         n_samples -= already_in
         sorted_df = data.sort_values(by=[id_, abs_, base, exponent], ascending=[True, False, False, True])
-        sorted_df[[id_, abs_, base, exponent, 'combined_sigma', 'sigma']].to_csv('sorted.csv', index=False)
+        #sorted_df[[id_, abs_, base, exponent, 'combined_sigma', 'sigma']].to_csv('sorted.csv', index=False)
 
         result = sorted_df.groupby(id_).apply(
             lambda group: group.drop_duplicates(subset=abs_, keep='first')
@@ -1006,11 +1181,101 @@ def filtering_df(data, n_samples, delta, id_, abs_, base, exponent):
             break
         else:
             dfs.append(result)
-            data = data[~data['index'].isin(result['index'])]
+            data = data[~data['temp_index'].isin(result['temp_index'])]
             already_in += len(result)
             if data.empty:
                 break
-    return pd.concat(dfs, ignore_index=True)
+    
+    return pd.concat(dfs, ignore_index=True).sort_values(by=[noise_ratio], ascending=True).iloc[:old_n_samples]
+
+def filtering_df_5(data, n_samples, delta, id_, abs_, base, exponent):
+    """
+    Filters and selects a subset of rows from a DataFrame based on relevance and specific sorting criteria.
+    The main aim of the function is to guarantee a good selection. This is achieved first by grouping by dataset id
+    and selecting the highest absolute mean value of the cropped image, the highest base and the lowest exponent difference
+    between the noisy image and the original image given by 'exponent' and then adding these rows to a new list and removing
+    such rows from the main DataFrame. This will be repeated till'n_samples' are achieved. 
+
+    The function applies a relevance check to each row using the `is_relevant_crop` function, filters the rows that
+    are considered relevant, and then selects a subset of rows based on specified sorting and grouping criteria.
+
+    The selection process groups the data by the specified `id_` column, drops duplicate entries based on the `abs_`
+    column, and selects rows with the highest `abs_` values, while considering other factors such as `base` and 
+    `exponent`. If the desired number of samples (`n_samples`) is not achievable, it adjusts by selecting the maximum
+    number of samples possible.
+
+    Args:
+        data (pd.DataFrame): The input DataFrame containing the data to be filtered. Must contain the specified
+            columns for filtering and sorting.
+        n_samples (int): The desired number of samples to select. If there are fewer relevant rows than `n_samples`,
+            the function will return as many rows as possible.
+        delta (float): A threshold factor for the `is_relevant_crop` function to determine if a row is relevant.
+        id_ (str): The column name representing the identifier used for grouping the data (dataset ID).
+        abs_ (str): The column name representing the absolute mean values used for sorting and filtering.
+        base (str): The column name representing the base value used for sorting (base of the variance in form of b*10**N).
+        exponent (str): The column name representing the exponent value used for sorting (N in b*10**N).
+
+    Returns:
+        pd.DataFrame: A filtered DataFrame containing the selected rows, with the specified number of samples.
+            The DataFrame is sorted by `abs_` in descending order, with duplicates removed based on `abs_`, and grouped
+            by the `id_` column.
+
+    Example:
+        data = pd.DataFrame({
+            'id': [1, 2, 1, 2],
+            'abs_mean': [0.8, 0.9, 0.75, 0.85],
+            'base': [0.5, 0.6, 0.5, 0.6],
+            'exponent': [2, 3, 2, 3],
+            'org_abs_mean': [1, 1, 1, 1],
+            'sigma': [0.1, 0.2, 0.15, 0.2]
+        })
+        
+        filtered_data = filtering_df(data, n_samples=2, delta=0.5, id_='id', abs_='abs_mean', base='base', exponent='exponent')
+        print(filtered_data)
+
+    Notes:
+        - The function will first filter out rows that are not relevant based on the `delta` threshold.
+        - If there are fewer rows than `n_samples`, the function will return as many as possible, with duplicates removed.
+        - The resulting DataFrame is sorted by `abs_` in descending order, `base` and `exponent` are sorted according to
+          their specified ascending/descending order.
+    """
+    if n_samples >= len(data):
+        return data
+
+    data['valid'] = data.apply(lambda row: is_relevant_crop(row, delta=delta), axis=1)
+    data = data[data['valid']]
+    data['ratio'] = data['abs_mean']/(np.maximum(data['org_abs_mean'], 1e-7))
+    if n_samples >= len(data):
+        return data
+
+    data.loc[:, 'temp_index'] = np.arange(0, len(data))
+    dfs = []
+    already_in = 0
+    first = True
+    while True:
+        n_samples -= already_in
+        if first:
+            sorted_df = data.sort_values(by=[id_, 'ratio', base, exponent], ascending=[True, False, False, True])
+        else:
+            data = data.sample(frac=1)
+            sorted_df = data.sort_values(by=[id_, base, exponent], ascending=[True, False, False, True])
+
+        result = sorted_df.groupby(id_).apply(
+            lambda group: group.drop_duplicates(subset=abs_, keep='first')
+        )
+        if len(result) >= n_samples:
+            dfs.append(result.sort_values(by=['ratio'], ascending=False, ignore_index=True).iloc[:n_samples])
+            break
+        else:
+            dfs.append(result)
+            data = data[~data['temp_index'].isin(result['temp_index'])]
+            already_in += len(result)
+            if data.empty:
+                break
+        first = False
+    return pd.concat(dfs, ignore_index=True).sample(frac=1)
+
+########################BASED ON VARIANCES ##################################
         
 def augment_samples(sigma, lowest_power=-4, highest_power=5, n_samples_per_magnitude=3):
     """
@@ -1062,10 +1327,10 @@ def augment_samples(sigma, lowest_power=-4, highest_power=5, n_samples_per_magni
                 for b in evenly_spaced_numbers(start, stop, n_samples_per_magnitude):
                     variance = b * 10.0**x
                     std = np.sqrt(variance)
-                    variances.append((variance, b, x-exponent))
+                    variances.append((variance, b, exponent, x-exponent))
     return variances
 
-def prepare_data_2(sampled_data, training, data_folder):
+def prepare_data_2(sampled_data, training, data_folder, scaling=None):
     """
     The default function used in the augmentation in 'data_augment_3()'
     Prepares noisy and original image pairs for training or evaluation by applying noise to the images based on the 
@@ -1105,40 +1370,181 @@ def prepare_data_2(sampled_data, training, data_folder):
     if 'name' not in sampled_data or 'noisy_sigma' not in sampled_data:
         return
 
-    names = sampled_data['name'].tolist()
-    data = {}
+    count = 0
+    while count < len(sampled_data):
+        names = sampled_data['name'].tolist()
+        data = {}
 
-    for index, row in sampled_data.iterrows():
-        names.pop(0)
-        filepath = row['name']
-        file = None
-        sigma_kernel = row['noisy_sigma']
-        sigma_kernel_2 = sigma_kernel**2
-        
-        if filepath in data:
-            file = data[filepath]
-        else:
-            if training == False:
-                train_eval = 'eval'
-            else:
-                train_eval = 'training'
+        for index, row in sampled_data.iterrows():
+            if count >= len(sampled_data):
+                break
 
-            actual_filepath = f'{os.path.dirname(__file__)}/{data_folder}/{train_eval}/{filepath}'
+            names.pop(0)
+            filepath = row['name']
+            file = None
+            sigma_kernel = row['noisy_sigma']
             
-            file = open_fits_2(actual_filepath)
-            if file is not None:
-                file = np.nan_to_num(file, nan=0)
-                if filepath in names and filepath not in data:
-                    data[filepath] = file
-                if filepath not in names and filepath in data:
-                    del data[filepath]
+            if filepath in data:
+                file = data[filepath]
+            else:
+                if training == False:
+                    train_eval = 'eval'
+                else:
+                    train_eval = 'training'
+
+                actual_filepath = f'{os.path.dirname(__file__)}/{data_folder}/{train_eval}/{filepath}'
+                file = open_fits_2(actual_filepath)
+                if file is not None:
+                    file = np.nan_to_num(file, nan=0)
+                    file = np.maximum(file, 0)
+                    if filepath in names and filepath not in data:
+                        data[filepath] = file
+            
+            if filepath not in names and filepath in data:
+                del data[filepath]
+            if file is None:
+                continue
 
             with_noise = file + np.random.normal(loc=0, scale=sigma_kernel, size=file.shape)
             with_noise = np.nan_to_num(with_noise, nan=0)
-            yield (np.expand_dims(with_noise, -1), np.expand_dims(file, -1),
-                    [f"{filepath.split('.fits')[0]}_{sigma_kernel_2:.5f}".replace('.', '_') + ".fits"])
+            min_val = np.min(with_noise)
+            if min_val < 0:
+                with_noise -= min_val
 
-def data_augment_3(images, kwargs_data):
+            if scaling is not None and scaling == 'log_min_max':
+                result =  adaptive_log_transform_and_normalize(with_noise)
+                if result is None:
+                    continue
+                with_noise, noise_min_val, noise_max_val, noise_shift = result
+
+                result =  adaptive_log_transform_and_normalize(file)
+                if result is None:
+                    continue
+                file, org_min_val, org_max_val, org_shift = result
+
+                stats = [f"{filepath.split('.fits')[0]}_{sigma_kernel:.5f}".replace('.', '_') + ".fits", 
+                        str(org_min_val), str(org_max_val), str(org_shift), str(noise_min_val), str(noise_max_val), str(noise_shift)]
+                
+            elif scaling is not None and scaling == 'z_scale':
+                result =  zscore_normalization(file)
+                if result is None:
+                    continue
+                file, org_mean, org_std = result
+                result =  zscore_normalization(with_noise)
+                if result is None:
+                    continue
+                with_noise, noise_mean, noise_std = result
+                stats = [f"{filepath.split('.fits')[0]}_{sigma_kernel:.5f}".replace('.', '_') + ".fits", 
+                        str(org_mean), str(org_std), str(noise_mean), str(noise_std)]
+                
+            elif scaling is not None and scaling == 'min_max':
+                result =  min_max_normalization(with_noise)
+                if result is None:
+                    continue
+                with_noise, noise_min, noise_max = result
+                result =  min_max_normalization(file)
+                if result is None:
+                    continue
+                file, org_min, org_max = result
+
+                stats = [f"{filepath.split('.fits')[0]}_{sigma_kernel:.5f}".replace('.', '_') + ".fits", 
+                        str(org_min), str(org_max), str(noise_min), str(noise_max)]
+            else:
+                stats = [f"{filepath.split('.fits')[0]}_{sigma_kernel:.5f}".replace('.', '_') + ".fits"]
+            yield (np.expand_dims(with_noise, -1), np.expand_dims(file, -1), stats)
+            count += 1
+
+def prepare_data_3(sampled_data, training, data_folder, scaling=None):
+    if 'name' not in sampled_data or 'noisy_sigma' not in sampled_data:
+        return
+
+    count = 0
+    while count < len(sampled_data):
+        names = sampled_data['name'].tolist()
+        data = {}
+        for index, row in sampled_data.iterrows():
+            if count >= len(sampled_data):
+                break
+
+            names.pop(0)
+            filepath = row['name']
+            file = None
+            noisy_sigma = row['noisy_sigma']
+            exp_time = row['exp_time']
+            new_exp_time = row['new_exp_time']
+            exp_ratio = row['exp_ratio']
+            sigma = row['sigma']
+            median = row['median']
+
+            if filepath in data:
+                file = data[filepath]
+            else:
+                if training == False:
+                    train_eval = 'eval'
+                else:
+                    train_eval = 'training'
+
+                actual_filepath = f'{os.path.dirname(__file__)}/{data_folder}/{train_eval}/{filepath}'
+                
+                file = open_fits_2(actual_filepath)
+                if file is not None:
+                    if filepath in names and filepath not in data:
+                        data[filepath] = file
+                        
+            if filepath not in names and filepath in data:
+                del data[filepath]
+            if file is None:
+                continue
+            file = np.maximum(file, 1e-8)
+            file = np.nan_to_num(file, nan=0.0, posinf=0.0, neginf=0.0)
+            #with_noise = create_noisy_image(file, exp_time, exp_ratio)
+            with_noise = create_noisy_image_gaussian(file, exp_ratio, median, sigma)
+
+            if scaling is not None and scaling == 'log_min_max':
+                result =  adaptive_log_transform_and_normalize(with_noise)
+                if result is None:
+                    continue
+                with_noise, noise_min_val, noise_max_val, noise_shift = result
+
+                result =  adaptive_log_transform_and_normalize(file)
+                if result is None:
+                    continue
+                file, org_min_val, org_max_val, org_shift = result
+
+                stats = [f"{filepath.split('.fits')[0]}_{round(exp_time)}__{round(new_exp_time)}".replace('.', '_') + ".fits", 
+                        str(org_min_val), str(org_max_val), str(org_shift), str(noise_min_val), str(noise_max_val), str(noise_shift)]
+                
+            elif scaling is not None and scaling == 'z_scale':
+                result =  zscore_normalization(with_noise)
+                if result is None:
+                    continue
+                with_noise, noise_mean, noise_std = result
+                result =  zscore_normalization(file)
+                if result is None:
+                    continue
+                file, org_mean, org_std = result
+
+                stats = [f"{filepath.split('.fits')[0]}_{round(exp_time)}__{round(new_exp_time)}".replace('.', '_') + ".fits", 
+                        str(org_mean), str(org_std), str(noise_mean), str(noise_std)]
+                
+            elif scaling is not None and scaling == 'min_max':
+                result =  min_max_normalization(with_noise)
+                if result is None:
+                    continue
+                with_noise, noise_min, noise_max = result
+                result =  min_max_normalization(file)
+                if result is None:
+                    continue
+                file, org_min, org_max = result
+
+                stats = [f"{filepath.split('.fits')[0]}_{round(exp_time)}__{round(new_exp_time)}".replace('.', '_') + ".fits", 
+                        str(org_min), str(org_max), str(noise_min), str(noise_max)]
+            else:
+                stats = [f"{filepath.split('.fits')[0]}_{round(exp_time)}__{round(new_exp_time)}".replace('.', '_') + ".fits"]
+            yield (np.expand_dims(with_noise, -1), np.expand_dims(file, -1), stats)
+            count += 1
+
+def data_augment_3(images, kwargs_data, scaling=None):
     """
     This is the main augmentation function used. 
     Augments data samples based on the provided metadata and other augmentation parameters.
@@ -1202,6 +1608,7 @@ def data_augment_3(images, kwargs_data):
     dataset = kwargs_data.get("dataset", None)
     median_col = kwargs_data.get("median_col", None)
     samples = kwargs_data.get('samples', 5000)
+    val_samples = kwargs_data.get('val_samples', 5000)
     low = kwargs_data.get("low", 90)
     high = kwargs_data.get('high', 15000)
     training = kwargs_data.get('training', True)
@@ -1217,6 +1624,11 @@ def data_augment_3(images, kwargs_data):
     abs_percent = kwargs_data.get('abs_percent', 25)
     conf_low = kwargs_data.get('conf_low', 2)
     conf_up = kwargs_data.get('conf_up', 2)
+    threshold= kwargs_data.get('threshold', 100)
+    lowest_exposure = kwargs_data.get('lowest_exposure', 200)
+    times = kwargs_data.get('times', 2)
+    ratio = kwargs_data.get('ratio', 10)
+
     columns_to_check = [
         metadata_filepath,
         exposure_col,
@@ -1236,14 +1648,224 @@ def data_augment_3(images, kwargs_data):
     conf_up = set_threshold(conf_up)
     conf_low = set_threshold(conf_low, start=True)
 
-    df = pd.read_csv(metadata_filepath)
-    df = df[(df[exposure_col] >= low) & (df[exposure_col] <= high)]
+    global MEM_CACHED, MEM_CACHED_EVAL
+    condition = MEM_CACHED is None if training else MEM_CACHED_EVAL is None
+    if condition:
+        df = pd.read_csv(metadata_filepath)
+        df = df[(df[exposure_col] >= times*low) & (df[exposure_col] <= high)]
 
-    #interested_stats_columns = find_columns(df.columns, suffixes, cutoff)
-    #if not interested_stats_columns:
-    #    raise Exception(f'No stats column to filter out data in with {suffixes}: {kwargs_data}. EXITING')
-    #interested_stats_col = interested_stats_columns[0]
+        #interested_stats_columns = find_columns(df.columns, suffixes, cutoff)
+        #if not interested_stats_columns:
+        #    raise Exception(f'No stats column to filter out data in with {suffixes}: {kwargs_data}. EXITING')
+        #interested_stats_col = interested_stats_columns[0]
+        
+        info = []
+        for _, row in df.iterrows():
+            sigma = row[sigma_col]
+            if is_not_nan(sigma):
+                variances = augment_samples(sigma,
+                                            lowest_power, highest_power,
+                                            n_samples_per_magnitude)
+                for var, base, exponent, difference in variances:
+                    if is_not_nan(var):
+                        sigma_kernel_2 = var - sigma**2
+                        if sigma_kernel_2 is None or sigma_kernel_2 < 0:
+                            continue
+                        sigma_kernel = np.sqrt(sigma_kernel_2)
+                        if sigma == 0:
+                            sigma_exponent = 0
+                            sigma_base = 0
+                        else:
+                            sigma_exponent = int(np.floor(np.log10(abs(sigma))))
+                            sigma_base = int(np.floor(sigma / (10.0 ** sigma_exponent)))
+
+                        info.append({'name' : row[name_col],
+                                        'base': base, 'exponent': exponent, 'difference' : difference,
+                                        'variance' : var, 'combined_sigma':np.sqrt(var),
+                                        'sigma': sigma, 'noisy_sigma': sigma_kernel,
+                                        'location':row[location_col], 'dataset' : row[dataset],
+                                        'abs_mean':row[abs_mean_col], 'org_abs_mean':row[org_abs_mean_col],
+                                        'stats_col':row[interested_stats_col],
+                                        'exp_time':row[exposure_col], 'sigma_base':sigma_base,
+                                        'sigma_exponent':sigma_exponent})
+                    else:
+                        continue
+            else:
+                continue   
+        info = pd.DataFrame(info)
+        #ranges = find_distribution(df, sigma_col)
+        #ranges = find_distribution_only_exp(df, sigma_col)
+        info = info.dropna(subset=['sigma', 'noisy_sigma', 'combined_sigma', 'variance',
+        'location', 'name', 'abs_mean', 'org_abs_mean', 'stats_col'])
+        info = info[(info['variance'] != 0) | (info['sigma'] != 0) | (info['noisy_sigma'] != 0) |
+                    (info['abs_mean'] != 0) | (info['org_abs_mean'] != 0) | (info['stats_col'] != 0) |
+                    (info['exp_time'] != 0)]
+        info['variance'] = info['variance'].abs()
+        info['sigma'] = info['sigma'].abs()
+        info['noisy_sigma'] = info['noisy_sigma'].abs()
+        info['abs_mean'] = info['abs_mean'].abs()
+        info['org_abs_mean'] = info['org_abs_mean'].abs()
+        info['stats_col'] = info['stats_col'].abs()
+        info = info[info['combined_sigma'] > info['sigma']]
+        info['conf_index'] = (info['combined_sigma'] - info['sigma']) / (info['combined_sigma'] + info['sigma'])
+        info['NSR_org'] = info['abs_mean'].mean()/info['sigma']
+        info['NSR_noisy'] = info['abs_mean'].mean()/info['combined_sigma']
+        info['NSR_ratio'] = info['NSR_org']/info['NSR_noisy']
+        info = info[info['NSR_ratio'] <= ratio]
+        info = info[(info['conf_index'] <= conf_up) & (info['conf_index'] >= conf_low)]
+        #info['range_valid'] = info.apply(lambda row: apply_ranges(ranges, row), axis=1)
+        #info['range_valid'] = info.apply(lambda row: apply_ranges_only_exponent(ranges, row), axis=1)
+        #info = info[info['range_valid']]
+        info.to_csv('info.csv',index=False)
+        #part1 = info[info['exp_time'] >= 10*lowest_exposure]
+        #part2 = info[(info['exp_time'] < 10*lowest_exposure) & (info['exp_time'] == 0)]  
+
+        #info = info[info['noisy_sigma'] <= info['org_abs_mean']*abs_percent/100]
+
+        x = min(samples if training else val_samples, len(info))  
+        if training:
+            info = info[info['location'].apply(lambda x: 'training' in str(x) if pd.notnull(x) else False)]
+        else:
+            info = info[info['location'].apply(lambda x: 'eval' in str(x) if pd.notnull(x) else False)]
+        
+        sampled = filtering_df(info, x, delta, 'dataset', 'abs_mean', 'base', 'difference', 'NSR_ratio')
+        print(samples if training else val_samples, len(info), x, len(sampled))
+        #sampled.to_csv('sampled.csv', index=False)
+        #sorted_df = sampled.sort_values(by=['dataset', 'abs_mean', 'base', 'exponent'], ascending=[True, False, False, True])
+        #sorted_df[['dataset', 'abs_mean', 'base', 'exponent', 'combined_sigma', 'sigma']].to_csv('sampled_sorted.csv', index=False)
+        if training:
+            info = sampled
+            MEM_CACHED = info
+            info.to_csv('./sampled_training.csv', index=False)
+            n = int(len(info)*0.25)
+            sampled = info.sample(n=n).reset_index(drop=True)
+        else:
+            info = sampled
+            MEM_CACHED_EVAL = info
+            info.to_csv('./sampled_eval.csv', index=False)
+            n = int(len(info)*0.1)
+            sampled = info.sample(n=n).reset_index(drop=True)
+    else:
+        if training:
+            info = MEM_CACHED
+            #info.to_csv('./sampled_training.csv', index=False)
+            n = int(len(info)*0.25)
+            sampled = info.sample(n=n).reset_index(drop=True)
+        else:
+            info = MEM_CACHED_EVAL
+            #info.to_csv('./sampled_eval.csv', index=False)
+            n = int(len(info)*0.1)
+            sampled = info.sample(n=n).reset_index(drop=True)
+    yield from prepare_data_2(sampled, training, data_folder, scaling)
+
+def data_augment_5(images, kwargs_data, scaling=None):
+    """
+    This is the main augmentation function used. 
+    Augments data samples based on the provided metadata and other augmentation parameters.
     
+    This function reads metadata from a CSV file and processes each row to apply data augmentation 
+    techniques to the images. For each valid row, it computes a range of synthetic variances based 
+    on the provided noise characteristics, generates augmented data, and prepares it for further 
+    processing. The function yields augmented data samples in batches, which can be used for 
+    training or evaluation purposes.
+
+    Args:
+        images (list): A list of image file paths to be processed. These are used for sampling.
+        kwargs_data (dict): A dictionary containing various parameters necessary for the augmentation 
+                            process, including metadata filepath, column names, sample parameters, 
+                            and thresholds for processing. The keys are:
+                            - 'metadata_filepath' (str): Path to the CSV file containing metadata.
+                            - 'exposure_col' (str): The name of the column containing exposure values.
+                            - 'name_col' (str): The name of the column containing image file names.
+                            - 'sigma_col' (str): The name of the column containing sigma values.
+                            - 'location_col' (str): The name of the column indicating location (training/eval).
+                            - 'abs_mean_col' (str): The column containing absolute mean values.
+                            - 'org_abs_mean_col' (str): The original absolute mean column for the uncropped images.
+                            - 'dataset' (str): The dataset identifier.
+                            - 'samples' (int): Number of samples to generate.
+                            - 'low' (float): Lower threshold for exposure values.
+                            - 'high' (float): Upper threshold for exposure values.
+                            - 'training' (bool): Whether to filter for training data (True) or evaluation (False).
+                            - 'lowest_power' (int): The lowest power for the variance augmentation.
+                            - 'highest_power' (int): The highest power for the variance augmentation.
+                            - 'n_samples_per_magnitude' (int): Number of samples to generate per variance magnitude.
+                            - 'delta' (float): Threshold for filtering data based on absolute mean values.
+                            - 'conf_low' (int): Lower threshold for confidence index filtering.
+                            - 'conf_up' (int): Upper threshold for confidence index filtering.
+                            - 'data_folder' (str): Path to the data folder containing the images.
+
+    Yields:
+        tuple: A tuple containing augmented data:
+            - Noisy image data (numpy array of shape (height, width, 1)).
+            - Clean image data (numpy array of shape (height, width, 1)).
+            - Image file name (string, e.g., "image_name_sigma_value.fits").
+    
+    Raises:
+        Exception: If any required parameter in `kwargs_data` is missing or invalid, or if insufficient 
+                   samples are available for the augmentation process.
+    
+    Example:
+        # Example usage
+        data_generator = data_augment_3(images=["image1.fits", "image2.fits"], kwargs_data=kwargs)
+        for noisy_image, clean_image, filename in data_generator:
+            # Use the augmented data in training or evaluation
+            pass
+    """
+        
+    metadata_filepath = kwargs_data.get('metadata_filepath', None)
+    exposure_col = kwargs_data.get('exposure_col', None)
+    name_col = kwargs_data.get("name_col", None)
+    sigma_col = kwargs_data.get("sigma_col", None)
+    location_col = kwargs_data.get("location_col", None)
+    abs_mean_col = kwargs_data.get("abs_mean_col", None)
+    org_abs_mean_col = kwargs_data.get("org_abs_mean_col", None)
+    dataset = kwargs_data.get("dataset", None)
+    samples = kwargs_data.get('samples', 5000)
+    val_samples = kwargs_data.get('val_samples', 5000)
+    low = kwargs_data.get("low", 90)
+    high = kwargs_data.get('high', 15000)
+    training = kwargs_data.get('training', True)
+    lowest_power = kwargs_data.get('lowest_power', -4)
+    highest_power = kwargs_data.get('highest_power', 2)
+    data_folder = kwargs_data.get('data_folder', None)
+    n_samples_per_magnitude = kwargs_data.get('n_samples_per_magnitude', 2) 
+    delta = kwargs_data.get('delta', 0.25) 
+    conf_low = kwargs_data.get('conf_low', 2)
+    conf_up = kwargs_data.get('conf_up', 2)
+    times = kwargs_data.get('times', 2)
+
+    columns_to_check = [
+        metadata_filepath,
+        exposure_col,
+        name_col,
+        sigma_col,
+        location_col,
+        abs_mean_col,
+        data_folder,
+        dataset,
+        org_abs_mean_col
+    ]
+    if any(col is None for col in columns_to_check):
+        raise Exception(f'One of the important parameters in the data arguments is None: {kwargs_data}. EXITING')
+    conf_up = set_threshold(conf_up)
+    conf_low = set_threshold(conf_low, start=True)
+
+    global MEM_CACHED, MEM_CACHED_EVAL
+    if MEM_CACHED is not None:
+        df = MEM_CACHED
+        first_training = False
+        first_eval = False
+    else:
+        df = pd.read_csv(metadata_filepath)
+        df = df[[sigma_col, exposure_col, name_col, location_col, abs_mean_col, org_abs_mean_col, dataset]]
+        df = df[(df[exposure_col] >= times*low) & (df[exposure_col] <= high)]
+        MEM_CACHED = df
+        first_training = True
+        first_eval = False
+    if MEM_CACHED_EVAL is None and not training: 
+        first_eval = True
+        MEM_CACHED_EVAL = df
+
     info = []
     for _, row in df.iterrows():
         sigma = row[sigma_col]
@@ -1251,113 +1873,444 @@ def data_augment_3(images, kwargs_data):
             variances = augment_samples(sigma,
                                         lowest_power, highest_power,
                                         n_samples_per_magnitude)
-            for var, base, exponent in variances:
+            for var, base, exponent, difference in variances:
                 if is_not_nan(var):
                     sigma_kernel_2 = var - sigma**2
                     if sigma_kernel_2 is None or sigma_kernel_2 < 0:
-                    #    print(sigma**2, var, sigma_kernel_2)
                         continue
                     sigma_kernel = np.sqrt(sigma_kernel_2)
+                    if sigma == 0:
+                        sigma_exponent = 0
+                        sigma_base = 0
+                    else:
+                        sigma_exponent = int(np.floor(np.log10(abs(sigma))))
+                        sigma_base = int(np.floor(sigma / (10.0 ** sigma_exponent)))
+
                     info.append({'name' : row[name_col],
-                                    'base': base, 'variance' : var, 'combined_sigma':np.sqrt(var),
+                                    'base': base, 'exponent': exponent, 'difference' : difference,
+                                    'variance' : var, 'combined_sigma':np.sqrt(var),
                                     'sigma': sigma, 'noisy_sigma': sigma_kernel,
                                     'location':row[location_col], 'dataset' : row[dataset],
                                     'abs_mean':row[abs_mean_col], 'org_abs_mean':row[org_abs_mean_col],
-                                    'exponent':exponent, 'stats_col':row[interested_stats_col]})
+                                    'exp_time':row[exposure_col], 'sigma_base':sigma_base,
+                                    'sigma_exponent':sigma_exponent})
                 else:
                     continue
         else:
             continue   
+
     info = pd.DataFrame(info)
-    info = info.dropna(subset=['sigma', 'noisy_sigma', 'combined_sigma', 'variance', 'location', 'name', 'abs_mean', 'org_abs_mean', 'stats_col'])
+    info = info.dropna(subset=['sigma', 'noisy_sigma', 'combined_sigma', 'variance',
+    'location', 'name', 'abs_mean', 'org_abs_mean'])
     info = info[(info['variance'] != 0) | (info['sigma'] != 0) | (info['noisy_sigma'] != 0) |
-                (info['abs_mean'] != 0) | (info['org_abs_mean'] != 0) | (info['stats_col'] != 0)]
+                (info['abs_mean'] != 0) | (info['org_abs_mean'] != 0)|
+                (info['exp_time'] != 0)]
     info['variance'] = info['variance'].abs()
     info['sigma'] = info['sigma'].abs()
     info['noisy_sigma'] = info['noisy_sigma'].abs()
     info['abs_mean'] = info['abs_mean'].abs()
     info['org_abs_mean'] = info['org_abs_mean'].abs()
-    info['stats_col'] = info['stats_col'].abs()
+    info = info[info['combined_sigma'] > info['sigma']]
     info['conf_index'] = (info['combined_sigma'] - info['sigma']) / (info['combined_sigma'] + info['sigma'])
     info = info[(info['conf_index'] <= conf_up) & (info['conf_index'] >= conf_low)]
-    #info = info[info['noisy_sigma'] <= info['org_abs_mean']*abs_percent/100]
+    if first_training  or first_eval:
+        info.to_csv('info.csv',index=False)
 
-    if len(info) and samples > len(info):
-        x = len(info)
-    elif len(info):
-        x = samples
-    else:
-        raise Exception(f'no adaquate sampling is possible')
-
+    x = min(samples if training else val_samples, len(info))  
     if training:
         info = info[info['location'].apply(lambda x: 'training' in str(x) if pd.notnull(x) else False)]
     else:
         info = info[info['location'].apply(lambda x: 'eval' in str(x) if pd.notnull(x) else False)]
     
-    print(info)
-    sampled = filtering_df(info, x, delta, 'dataset', 'abs_mean', 'base', 'exponent')
-    sampled.to_csv('sampled.csv', index=False)
-    sorted_df = sampled.sort_values(by=['dataset', 'abs_mean', 'base', 'exponent'], ascending=[True, False, False, True])
-    sorted_df[['dataset', 'abs_mean', 'base', 'exponent', 'combined_sigma', 'sigma']].to_csv('sampled_sorted.csv', index=False)
-    print(sampled)
-    sampled = sampled.sample(frac=1).reset_index(drop=True)
-    yield from prepare_data_2(sampled, training, data_folder)
+    sampled = filtering_df_5(info, x, delta, 'dataset', 'abs_mean', 'base', 'difference')
+    if first_training or first_eval:
+        print(samples if training else val_samples, len(info), x, len(sampled))
+
+    if training:
+        if first_training:
+            sampled = sampled.sample(frac=1).reset_index(drop=True)
+            sampled.to_csv('./sampled_training.csv', index=False)
+    else:
+        if first_eval:
+            sampled = sampled.sample(frac=1).reset_index(drop=True)
+            sampled.to_csv('./sampled_eval.csv', index=False)
+    yield from prepare_data_2(sampled, training, data_folder, scaling)
+
+def create_ratios(ratio_initial, ratio_count, ratio_growth):    
+    ratios = []
+    i = ratio_initial
+    for _ in range(ratio_count):
+        ratios.append(i)
+        i = int(np.ceil(i * ratio_growth))
+    return ratios
+
+def turn_exp_to_noisy_sigma(exp, sigma, ratio):
+    new_exp = exp / ratio
+    new_sigma = np.sqrt(exp / new_exp) * sigma
+    return new_sigma, new_exp
+
+def create_noisy_image(image, old_exp, gamma):
+    new_exp = old_exp / gamma
+    signal = np.maximum(image, 1e-6) 
+    signal_scaled = signal * new_exp
+    signal_noisy = np.random.poisson(signal_scaled) / new_exp
+    noisy_image = signal_noisy
+    return np.maximum(noisy_image, 1e-6)
+
+def create_noisy_image_gaussian(image, gamma, median_bkg, std_bkg):
+    signal = image-median_bkg
+    new_sigma = np.sqrt(gamma)*std_bkg
+    noisy_image = signal + np.random.normal(loc=median_bkg, scale=new_sigma, size=image.shape)
+    return np.maximum(noisy_image, 1e-6)
+
+def data_augment_last(images, kwargs_data, scaling=None):
+    data_folder = kwargs_data.get('data_folder', None)
+    name_col = kwargs_data.get("name_col", None)
+    training = kwargs_data.get('training', True)
+    metadata_filepath = kwargs_data.get('metadata_filepath', None)
+    dataset = kwargs_data.get("dataset", None)
+    sigma_col = kwargs_data.get("sigma_col", None)
+    samples = kwargs_data.get('samples', 5000)
+    val_samples = kwargs_data.get('val_samples', 5000)
+    times = kwargs_data.get('times', 2)
+    low = kwargs_data.get("low", 90)
+    high = kwargs_data.get('high', 15000)
+    exposure_col = kwargs_data.get('exposure_col', None)
+    location_col = kwargs_data.get("location_col", None)
+    abs_mean_col = kwargs_data.get("abs_mean_col", None)
+    org_abs_mean_col = kwargs_data.get("org_abs_mean_col", None)
+    ratio_initial = kwargs_data.get('ratio_initial', 2)
+    ratio_count = kwargs_data.get('ratio_count', 10)
+    ratio_growth = kwargs_data.get('ratio_growth', 1.5)
+    median_col = kwargs_data.get('median_col', None)
+    ratios = create_ratios(ratio_initial, ratio_count, ratio_growth)
+
+    columns_to_check = [
+        metadata_filepath,
+        exposure_col,
+        sigma_col,
+        location_col,
+        abs_mean_col,
+        data_folder,
+        dataset,
+        org_abs_mean_col,
+        name_col,
+        median_col
+    ]
+    if any(col is None for col in columns_to_check):
+        raise Exception(f'One of the important parameters in the data arguments is None: {kwargs_data}. EXITING')
+
+    global MEM_CACHED, MEM_CACHED_EVAL
+    if MEM_CACHED is not None:
+        df = MEM_CACHED
+        first_training = False
+        first_eval = False
+    else:
+        df = pd.read_csv(metadata_filepath)
+        df = df[[sigma_col, exposure_col, name_col, location_col, abs_mean_col, org_abs_mean_col, dataset, median_col]]
+        df = df[(df[exposure_col] >= times*low) & (df[exposure_col] <= high)]
+        MEM_CACHED = df
+        first_training = True
+        first_eval = False
+    if MEM_CACHED_EVAL is None and not training: 
+        first_eval = True
+        MEM_CACHED_EVAL = df
+
+    info = []
+    for _, row in df.iterrows():
+        sigma = row[sigma_col]
+        exp = row[exposure_col]
+        if is_not_nan(sigma):
+            for ratio in ratios:
+                
+                new_sigma, new_exp = turn_exp_to_noisy_sigma(exp, sigma, ratio)
+                noisy_sigma = np.sqrt(new_sigma**2 - sigma**2) if new_sigma**2 > sigma**2 else np.nan
+                info.append({
+                    'dataset': row[dataset],
+                    'name' : row[name_col],
+                    'patch' : os.path.basename(row[location_col]),
+                    'location': row[location_col],
+                    'exp_time': exp,
+                    'new_exp_time': new_exp,
+                    'combined_sigma': new_sigma,
+                    'noisy_sigma': noisy_sigma,
+                    'sigma': sigma,
+                    'exp_ratio' : round(row[exposure_col]/new_exp, 2),
+                    'abs_mean':row[abs_mean_col], 
+                    'org_abs_mean':row[org_abs_mean_col],
+                    'median' : row[median_col]
+                })
+
+    info = pd.DataFrame(info)
+    info = info.dropna()
+    info = info[info['median'] > 0] 
+    info = info[info['combined_sigma'] > info['sigma']]
+    info = info[info['exp_time'] > info['new_exp_time']]
+    info = info[info['new_exp_time'] >= low]
+    info['noisy_sigma'] = info['noisy_sigma'].abs()
+    info['sigma'] = info['sigma'].abs()
+    info['combined_sigma'] = info['combined_sigma'].abs()
+    info['abs_mean'] = info['abs_mean'].abs()
+    info['org_abs_mean'] = info['org_abs_mean'].abs()
+    info['exp_time'] = info['exp_time'].abs()
+    info['new_exp_time'] = info['new_exp_time'].abs()
+    info['SNR'] = info['org_abs_mean']/info['sigma']
+    info['SNR_noisy'] = info['org_abs_mean']/info['combined_sigma']
+    info = info.sample(frac=1).reset_index(drop=True)
+
+    if first_training or first_eval:
+        info.to_csv('info.csv',index=False)
+
+    x = min(samples if training else val_samples, len(info))  
+    if training:
+        info = info[info['location'].apply(lambda x: 'training' in str(x) if pd.notnull(x) else False)]
+    else:
+        info = info[info['location'].apply(lambda x: 'eval' in str(x) if pd.notnull(x) else False)]
     
-def create_tf_dataset(images, sample_generator, generator_kwargs, batch_size=32):
+    sampled = info.sample(frac=1)
+
+    if first_training or first_eval:
+        print(samples if training else val_samples, len(info), x, len(sampled))
+
+    if training:
+        if first_training:
+            sampled = sampled.reset_index(drop=True)
+            sampled.to_csv('./sampled_training.csv', index=False)
+    else:
+        if first_eval:
+            sampled = sampled.reset_index(drop=True)
+            sampled.to_csv('./sampled_eval.csv', index=False)
+    sampled = sampled.sample(frac=1)
+    yield from prepare_data_3(sampled, training, data_folder, scaling)
+    
+########################BASED ON SNR AND SIGMA ##################################
+#################################################################################
+def calculate_noisy_sigma(sigma, t1, t2):
+    if t2 != 0:
+        coeff = t1/t2 - 1
+        if coeff > 0:
+            return sigma*np.sqrt(coeff)
+    return 0
+
+def augment_samples_2(sigma, start, end, n_samples_per_magnitude=3):
+    sigmas = []
+    if is_not_nan(sigma) and sigma != 0.0:
+            magnitudes = np.ceil(np.log10(end))
+            numbers = np.linspace(start, end, int(magnitudes*n_samples_per_magnitude+1))[0:-1]
+            for number in numbers:
+                sigmas.append((calculate_noisy_sigma(sigma, end, number), 0, 0, number))
+                #sigmas.append((calculate_noisy_sigma(sigma, end, number), 0, 0, number))
+    return sigmas
+
+def filtering_df_2(data, n_samples, delta, id_, abs_, noise_ratio):
+    if n_samples >= len(data):
+        return data
+
+    data['valid'] = data.apply(lambda row: is_relevant_crop(row, delta=delta), axis=1)
+    data = data[data['valid']]
+
+    if n_samples >= len(data):
+        return data
+
+    data.loc[:, 'temp_index'] = np.arange(0, len(data))
+    dfs = []
+    already_in = 0
+    while True:
+        n_samples -= already_in
+        sorted_df = data.sort_values(by=[id_, abs_, noise_ratio], ascending=[True, False, False])
+        #sorted_df[[id_, abs_, base, exponent, 'combined_sigma', 'sigma']].to_csv('sorted.csv', index=False)
+
+        result = sorted_df.groupby(id_).apply(
+            lambda group: group.drop_duplicates(subset=abs_, keep='first')
+        )
+        if len(result) >= n_samples:
+            dfs.append(result.sort_values(by=[abs_], ascending=False, ignore_index=True).iloc[:n_samples])
+            break
+        else:
+            dfs.append(result)
+            data = data[~data['temp_index'].isin(result['temp_index'])]
+            already_in += len(result)
+            if data.empty:
+                break
+    return pd.concat(dfs, ignore_index=True)
+
+def data_augment_4(images, kwargs_data, scaling=None):
+    metadata_filepath = kwargs_data.get('metadata_filepath')
+    exposure_col = kwargs_data.get('exposure_col')
+    name_col = kwargs_data.get("name_col")
+    sigma_col = kwargs_data.get("sigma_col")
+    location_col = kwargs_data.get("location_col")
+    org_abs_mean_col = kwargs_data.get("org_abs_mean_col")
+    abs_mean_col = kwargs_data.get("abs_mean_col")
+    dataset = kwargs_data.get("dataset")
+    samples = kwargs_data.get('samples', 16000)
+    val_samples = kwargs_data.get('val_samples', 4000)
+    low = kwargs_data.get("low", 90)
+    high = kwargs_data.get('high', 15000)
+    training = kwargs_data.get('training', True)
+    powers = kwargs_data.get('powers', 3)
+    data_folder = kwargs_data.get('data_folder')
+    n_samples_per_magnitude = kwargs_data.get('n_samples_per_magnitude', 2) 
+    delta = kwargs_data.get('delta', 0.25) 
+    conf_low = kwargs_data.get('conf_low', 2)
+    conf_up = kwargs_data.get('conf_up', 2)
+    times = kwargs_data.get('times', 2)
+    min_ratio = kwargs_data.get('min_ratio', 0)
+    ratio = kwargs_data.get('ratio', 1000)
+
+    global MEM_CACHED, MEM_CACHED_EVAL
+    condition = MEM_CACHED is None if training else MEM_CACHED_EVAL is None
+    if condition:
+        columns_to_check = [
+            metadata_filepath, exposure_col, name_col, sigma_col,
+            location_col, abs_mean_col, org_abs_mean_col, data_folder, dataset
+        ]
+
+        if any(col is None for col in columns_to_check):
+            raise Exception(f'One of the important parameters in the data arguments is None: {kwargs_data}. EXITING')
+
+        conf_up = set_threshold(conf_up)
+        conf_low = set_threshold(conf_low, start=True)
+
+        df = pd.read_csv(metadata_filepath)
+        df = df[(df[exposure_col] >= times * low) & (df[exposure_col] <= high)]
+
+        info = []
+        for _, row in df.iterrows():
+            sigma = row[sigma_col]
+            if is_not_nan(sigma):
+                sigmas = augment_samples_2(sigma, low, row[exposure_col], n_samples_per_magnitude)
+                for noisy_sigma, difference, base, time_ratio in sigmas:
+                    combined_sigma = np.sqrt(sigma**2 + noisy_sigma**2)
+                    info.append({
+                        'name': row[name_col],
+                        'combined_sigma': combined_sigma,
+                        'noisy_sigma': noisy_sigma,
+                        'sigma': sigma,
+                        'location': row[location_col],
+                        'dataset': row[dataset],
+                        'abs_mean': row[abs_mean_col],
+                        'org_abs_mean': row[org_abs_mean_col],
+                        'exp_time': row[exposure_col],
+                        'org_signal_to_noise': row[abs_mean_col] / sigma,
+                        'aug_signal_to_noise': row[abs_mean_col] / combined_sigma,
+                        #'difference': difference,
+                        #'base': base,
+                        #'new_exp_time' : row[exposure_col]*time_ratio
+                        'new_exp_time' : time_ratio
+                    })
+
+        info = pd.DataFrame(info).dropna()
+        info = info[(info['sigma'] != 0) | (info['noisy_sigma'] != 0) |
+                     (info['combined_sigma'] != 0) | (info['abs_mean'] != 0) |
+                     (info['org_abs_mean'] != 0) | (info['aug_signal_to_noise'] != 0) |
+                     (info['org_signal_to_noise'] != 0) | (info['exp_time'] != 0)]
+        abs_columns = ['sigma', 'noisy_sigma', 'combined_sigma', 'abs_mean', 'org_abs_mean',
+                        'org_signal_to_noise', 'aug_signal_to_noise']
+        info[abs_columns] = info[abs_columns].abs()
+
+        info = info[info['new_exp_time'] >= low]
+        info = info[info['combined_sigma'] > info['sigma']]
+        info['conf_index'] = (info['combined_sigma'] - info['sigma']) / (info['combined_sigma'] + info['sigma'])
+        info = info[(info['conf_index'] <= conf_up) & (info['conf_index'] >= conf_low)]
+        info.to_csv('./info.csv', index=False)
+        info = info[info['aug_signal_to_noise'] * ratio >= info['org_signal_to_noise']]
+        #info = info[info['aug_signal_to_noise'] >= min_ratio]
+
+        if not len(info):
+            raise Exception('No adequate sampling is possible')
+
+        x = min(samples if training else val_samples, len(info))    
+        if training:
+            info = info[info['location'].str.contains('training', na=False)]
+        else:
+            info = info[info['location'].str.contains('eval', na=False)]
+
+        #sampled = filtering_df(info, x, delta, 'dataset', 'abs_mean', 'base', 'difference')
+        sampled = filtering_df_2(info, x, delta, 'dataset', 'abs_mean', 'aug_signal_to_noise')
+        print(samples if training else val_samples, len(info), x, len(sampled))
+        if training:
+            info = sampled
+            MEM_CACHED = info
+            info.to_csv('./sampled_training.csv', index=False)
+            n = int(len(info)*0.25)
+            sampled = info.sample(n=n).reset_index(drop=True)
+        else:
+            info = sampled
+            MEM_CACHED_EVAL = info
+            info.to_csv('./sampled_eval.csv', index=False)
+            n = int(len(info)*0.1)
+            sampled = info.sample(n=n).reset_index(drop=True)
+    else:
+        if training:
+            info = MEM_CACHED
+            #info.to_csv('./sampled_training.csv', index=False)
+            n = int(len(info)*0.25)
+            sampled = info.sample(n=n).reset_index(drop=True)
+        else:
+            info = MEM_CACHED_EVAL
+            #info.to_csv('./sampled_eval.csv', index=False)
+            n = int(len(info)*0.1)
+            sampled = info.sample(n=n).reset_index(drop=True)
+    yield from prepare_data_2(sampled, training, data_folder, scaling)
+
+def create_tf_dataset(images, sample_generator, generator_kwargs, batch_size=32, scaling=None, rotation_range=10):
     """
-    Creates a TensorFlow Dataset from a data augmentation generator with optimized parallelization.
-    
-    This function generates a TensorFlow Dataset object from a data augmentation generator. It converts 
-    the output of the generator into a dataset that can be used for training deep learning models in 
-    TensorFlow. The dataset is processed with optimizations for parallelization, batching, and prefetching 
-    to enhance performance during training.
+    Creates a TensorFlow Dataset with small random rotations, flips, and 90° rotations.
 
     Args:
-        images (list): A list of image file paths to be processed by the generator.
-        sample_generator (callable): A generator function that yields data, typically in the form of tuples 
-                                      (noisy image, clean image, file path).
-        generator_kwargs (dict): A dictionary of keyword arguments passed to the sample generator, 
-                                 typically including data augmentation parameters (e.g., `ps`, `steps`).
-        batch_size (int, optional): The batch size to be used in the TensorFlow Dataset. Default is 32.
+        images (list): List of image file paths.
+        sample_generator (callable): Generator function yielding (noisy image, clean image, file path).
+        generator_kwargs (dict): Keyword arguments passed to the sample generator.
+        batch_size (int, optional): Batch size. Default is 32.
+        scaling (str, optional): Scaling method. Default is None.
+        rotation_range (int, optional): Max rotation in degrees (e.g., 10° results in [-10°, 10°]).
 
     Returns:
-        tf.data.Dataset: A TensorFlow Dataset object containing batches of images and file paths. 
-                         The dataset is optimized with shuffling, batching, and prefetching for efficient training.
-
-    Example:
-        # Example of using the function to create a TensorFlow Dataset
-        dataset = create_tf_dataset(images=["image1.fits", "image2.fits"], 
-                                    sample_generator=data_augment, 
-                                    generator_kwargs={'ps': 256}, 
-                                    batch_size=16)
-        for noisy, clean, filenames in dataset:
-            # Use the batches for training
-            pass
-
-    Notes:
-        - The `sample_generator` should yield data in the form of tuples (noisy image, clean image, file path).
-        - The dataset will be processed using the TensorFlow data pipeline features such as shuffling, 
-          batching, and prefetching for optimal performance during training.
-        - The `ps` parameter from `generator_kwargs` defines the size of the patches to be generated.
-        - The batch size should be chosen based on the available memory and model requirements.
+        tf.data.Dataset: Augmented TensorFlow dataset.
     """
+    shape = 1
+    if scaling in ['log_min_max']:
+        shape = 7
+    elif scaling in ['z_scale', 'min_max']:
+        shape = 5
+
     def generator():
-        yield from sample_generator(images=images, kwargs_data=generator_kwargs)
-    
+        yield from sample_generator(images=images, kwargs_data=generator_kwargs, scaling=scaling)
+
     ps = generator_kwargs.get('ps', 256)
-    dataset = tf.data.Dataset.from_generator(generator,
-                                              output_signature=(
-                                                  tf.TensorSpec(shape=(ps, ps, 1), dtype=tf.float32),  # x_train
-                                                  tf.TensorSpec(shape=(ps, ps, 1), dtype=tf.float32),  # y_train
-                                                  tf.TensorSpec(shape=(1), dtype=tf.string)              # filepaths
-                                              ))
+    dataset = tf.data.Dataset.from_generator(
+        generator,
+        output_signature=(
+            tf.TensorSpec(shape=(ps, ps, 1), dtype=tf.float32),  # x_train (noisy)
+            tf.TensorSpec(shape=(ps, ps, 1), dtype=tf.float32),  # y_train (clean)
+            tf.TensorSpec(shape=(shape), dtype=tf.string)  # file paths
+        )
+    )
 
-    dataset = dataset.map(lambda x, y, z: (tf.convert_to_tensor(x), tf.convert_to_tensor(y), tf.convert_to_tensor(z)),
-                          num_parallel_calls=tf.data.AUTOTUNE)
+    def apply_augmentations(x, y, z):
+        """Applies small random rotations, flips, and 90° rotations."""
+        # Small random rotation (-rotation_range° to +rotation_range°)
+        #angle = tf.random.uniform([], -rotation_range, rotation_range) * np.pi / 180
+        #x = tfa.image.rotate(x, angle, interpolation="BILINEAR")
+        #y = tfa.image.rotate(y, angle, interpolation="BILINEAR")
 
-    dataset = dataset.shuffle(buffer_size=100) 
-    dataset = dataset.batch(batch_size)          
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+        # Random 90° rotation (0°, 90°, 180°, 270°)
+        k = tf.random.uniform([], 0, 4, dtype=tf.int32)  # Random integer 0-3
+        x = tf.image.rot90(x, k)
+        y = tf.image.rot90(y, k)
+
+        # Random horizontal & vertical flips
+        #x = tf.image.random_flip_left_right(x)
+        #x = tf.image.random_flip_up_down(x)
+        #y = tf.image.random_flip_left_right(y)
+        #y = tf.image.random_flip_up_down(y)
+
+        return x, y, z
+
+    dataset = dataset.map(apply_augmentations, num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
     return dataset
 
 ############ CHECKPOINTS ##########################################################################
@@ -1435,7 +2388,7 @@ def load_model(checkpoint_dir, start_from_best, start_from_last, start_from_scra
     if start_from_best == start_from_last:
         raise ValueError("Cannot start from both 'best' and 'last' checkpoints simultaneously.")
     if start_from_scratch and os.path.exists(checkpoint_dir):
-        shutil.rmtree(checkpoint_dir)
+        #shutil.rmtree(checkpoint_dir)
         return start_epoch
     
     # Get lists of available best epochs and model epochs
@@ -1467,7 +2420,7 @@ def load_model(checkpoint_dir, start_from_best, start_from_last, start_from_scra
 def train_network(input_shape, folder, n_epochs, kwargs_data, kwargs_network, data_generator, batch_size=32, network_name='model',
          optimizer=Adam, change_learning_rate=[(0, 1e-4), (2000, 1e-5)], G_loss_fn=tf.keras.losses.MeanAbsoluteError(),
          start_from_scratch=False, start_from_best=False, start_from_last=True,
-         save_freq=500, eval_percent=20, period_save=30):
+         save_freq=500, eval_percent=20, period_save=30, scaling=None):
     """
     Trains a neural network model using the provided dataset and configuration.
 
@@ -1514,10 +2467,9 @@ def train_network(input_shape, folder, n_epochs, kwargs_data, kwargs_network, da
     """
 
     # Ensures that the dateset exists and checks
-    if os.path.exists(folder):
-        os.chdir(folder)
-    else:
+    if not os.path.exists(folder):
         os.makedirs(folder, exist_ok=True)
+    os.chdir(folder)
     if not callable(G_loss_fn):
         raise ValueError("The 'G_loss_fn' must be callable.")
     
@@ -1536,7 +2488,7 @@ def train_network(input_shape, folder, n_epochs, kwargs_data, kwargs_network, da
     
     #Creation of folders
     try:
-        results_folder = os.path.join(os.getcwd(), 'models', network_name)
+        results_folder = f'./{network_name}'
         if not os.path.exists(results_folder):
             os.makedirs(results_folder, exist_ok=True)
         os.chdir(results_folder)
@@ -1551,7 +2503,7 @@ def train_network(input_shape, folder, n_epochs, kwargs_data, kwargs_network, da
     train_dataset = create_tf_dataset(train_data,
                                     data_generator,
                                     generator_kwargs=kwargs_data,
-                                    batch_size=batch_size)
+                                    batch_size=batch_size, scaling=scaling)
 
     # Restoring prior epochs
     checkpoint_dir = './checkpoints'
@@ -1578,7 +2530,9 @@ def train_network(input_shape, folder, n_epochs, kwargs_data, kwargs_network, da
         kwargs_validation=kwargs_val,
         validation_images = eval_data,
         optimizer=optimizer,
-        change_learning_rate=change_learning_rate
+        change_learning_rate=change_learning_rate,
+        batch_size = batch_size,
+        scaling = scaling
     )
     checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
     #Train the model
@@ -1589,9 +2543,30 @@ def train_network(input_shape, folder, n_epochs, kwargs_data, kwargs_network, da
     except Exception as err:
         logging.warning(f'an error occurred while saving the history: {err}')
 
-def __main__():
+######################lOSS FUNCTIONS#############################
+def scale_invariant_mae(y_true, y_pred):
+    # Get the range of the ground truth image (y_true) for each image in the batch
+    range_true = tf.reduce_max(y_true, axis=(1, 2, 3), keepdims=True) - tf.reduce_min(y_true, axis=(1, 2, 3), keepdims=True) + 1e-10
+    # Compute the Mean Absolute Error (MAE) across the height, width, and channels
+    mae = tf.reduce_mean(tf.abs(y_true - y_pred), axis=(1, 2, 3))
+    # Normalize by the range of the ground truth
+    return tf.reduce_mean(mae / range_true)
+
+def log_cosh_loss(y_true, y_pred):
+    # Get the range of the ground truth image (y_true) for each image in the batch
+    range_true = tf.reduce_max(y_true, axis=(1, 2, 3), keepdims=True) - tf.reduce_min(y_true, axis=(1, 2, 3), keepdims=True) + 1e-10
+    # Compute the Log-Cosh loss
+    log_cosh = tf.reduce_mean(tf.math.log(tf.cosh(y_pred - y_true)), axis=(1, 2, 3))
+    # Normalize by the range of the ground truth
+    return tf.reduce_mean(log_cosh / range_true)
+
+def main():
+    
     data_dir = 'our_data'
-    data_dir = 'nsigma3_fprint_5_npixels_5'
+    data_dir = 'nsigma2_fprint_5_npixels_5'
+    #data_dir = 'gal_data'
+    if len(sys.argv) > 3:
+        data_dir = sys.argv[3]
     kwargs_data = {
         'type_of_image':'SCI',
         'ps' : 256, 
@@ -1630,12 +2605,17 @@ def __main__():
         'metadata_filepath' : f'{os.path.dirname(__file__)}/{data_dir}/cropped_images_stats.csv',
         'exposure_col' : 'sci_actual_duration', 
         'name_col' : 'filename',
-        'sigma_col' : 'org_std',
-        'samples' : 30000,
-        'low' : 90, 
-        'high' : 15000,
+        #'sigma_col': 'org_std',
+        'sigma_col': 'org_light_std',
+        'samples': 3000,
+        'val_samples' : 32,
+        'low' : 200, 
+        'high' : 20000,
         'location_col' : 'location',
-        'abs_mean_col' : 'abs_mean',
+        #'abs_mean_col': 'abs_mean',
+        'abs_mean_col': 'mean',
+        #'org_abs_mean_col': 'org_abs_mean',
+        'org_abs_mean_col': 'org_mean',
         'training_path' :f'{os.path.dirname(__file__)}/{data_dir}/training',
         'eval_path' :f'{os.path.dirname(__file__)}/{data_dir}/eval',
         'lowest_power' : -4,
@@ -1643,8 +2623,7 @@ def __main__():
         'data_folder' : f'{data_dir}',
         'median_col' : 'org_median',
         'n_samples_per_magnitude' : 3,
-        'delta' : 0.25,
-        'org_abs_mean_col' : 'org_abs_mean',
+        'delta' : 0.50,
         'dataset' : 'sci_data_set_name',
         'cutoff' : 94,
         'suffixes' : ['mean'],
@@ -1652,9 +2631,66 @@ def __main__():
         'light_col' : 'light_median',
         'abs_percent' : 35,
         'conf_low' : 2,
-        'conf_up' : 2
+        'conf_up' : 2,
+        'threshold' : 100,
+        'lowest_exposure' : 200,
+        'times' : 2,
+        'training' : True,
+        'ratio': 10,
     }
 
+    kwargs_data_4 = {
+    'metadata_filepath': f'{os.path.dirname(__file__)}/{data_dir}/cropped_images_stats.csv',
+    'training_path' :f'{os.path.dirname(__file__)}/{data_dir}/training',
+    'eval_path' :f'{os.path.dirname(__file__)}/{data_dir}/eval',
+    'exposure_col': 'sci_actual_duration', 
+    'name_col': 'filename',
+    'sigma_col': 'org_light_std',
+    'location_col': 'location',
+    'abs_mean_col': 'mean',
+    'org_abs_mean_col': 'org_mean',
+    'dataset': 'sci_data_set_name',
+    'samples': 16000,
+    'val_samples' : 4000,
+    'low': 200,
+    'high': 20000,
+    'training': True,
+    'powers': 3,
+    'data_folder': f'{data_dir}',
+    'n_samples_per_magnitude': 5,
+    'delta': 0.25,
+    'conf_low': 2,
+    'conf_up': 2,
+    'times': 2,
+    'min_ratio': 0.5,
+    'ratio': 10
+    }
+
+    kwargs_data_last = {
+    'metadata_filepath' : f'{os.path.dirname(__file__)}/{data_dir}/cropped_images_stats.csv',
+    'name_col': 'filename',
+    'exposure_col' : 'actual_exp_time', 
+    'sigma_col': 'org_light_std',
+    'samples': 3000,
+    'val_samples' : 10,
+    'low' : 200, 
+    'high' : 20000,
+    'location_col' : 'location',
+    'abs_mean_col': 'mean',
+    'org_abs_mean_col': 'org_mean',
+    'median_col' : 'org_light_median',
+    'training_path' :f'{os.path.dirname(__file__)}/{data_dir}/training',
+    'eval_path' :f'{os.path.dirname(__file__)}/{data_dir}/eval',
+    'data_folder' : f'{data_dir}',
+    'dataset' : 'sci_data_set_name',
+    'lowest_exposure' : 200,
+    'times' : 2,
+    'training' : True,
+    'ratio_initial' : 2,
+    'ratio_count' : 10, 
+    'ratio_growth' : 1.5
+    }
+    
     kwargs_network = {
         'depth':5,
         'kernel_size':3,
@@ -1664,35 +2700,56 @@ def __main__():
         'func':tf.keras.layers.LeakyReLU,
         'batch_normalization':True,
         'exp' : None,
-        'exp_time':None
+        'exp_time':None,
+        'dropout_rate':0.1
     }
 
     input_shape = (256, 256, 1)
     folder = './models'
-    batch_size = 32
-    n_epochs = 3000
-    network_name='model_gpu_2'
+    batch_size = 16
+    n_epochs = 1000
     optimizer=Adam
-    change_learning_rate=[(0, 1e-4), (1000, 1e-5)]
+    change_learning_rate=[(0, 1e-4), (1000, 3e-5)]
     G_loss_fn=MeanAbsoluteError()
-    start_from_scratch=True
-    start_from_best=True
-    start_from_last=False
-    save_freq=1
-    eval_percent=1
-    period_save=1
+    #G_loss_fn = scale_invariantu_mae
+    #G_loss_fn = log_cosh_loss
+    start_from_scratch=False
+    start_from_best=False
+    start_from_last=True
+    save_freq=25
+    eval_percent=5
+    period_save=5
+
+    network_name='model_gpu_5'
+    network_name='model_gpu_scaling_min_max_random'
+    network_name='z_scale_1e4_random'
+    #network_name='model_gpu_no_scaling_3_e5_random'
+    network_name='no_scaling_1e4_random'
+    #scaling='min_max'
+    #scaling='z_scale'
+    scaling=None
+
+    if len(sys.argv) > 1:
+        network_name = sys.argv[1]
+    if len(sys.argv) > 2:
+        if sys.argv[2] != 'None':
+            scaling = sys.argv[2]
 
     directory_path = os.path.dirname(os.path.abspath(__file__))
     os.chdir(directory_path)
 
     logging.warning(f"Num GPUs Available: {len(tf.config.experimental.list_physical_devices('GPU'))}")
-    train_network(input_shape, folder, n_epochs, kwargs_data_3, kwargs_network,
-                  data_generator=data_augment_3, batch_size=batch_size,
+    train_network(input_shape, folder, n_epochs, kwargs_data_4, kwargs_network,
+                  data_generator=data_augment_5, batch_size=batch_size,
                   network_name=network_name,
                   optimizer=optimizer,change_learning_rate=change_learning_rate,
                   G_loss_fn=G_loss_fn, start_from_scratch=start_from_scratch,
                   start_from_best=start_from_best, start_from_last=start_from_last,
                   save_freq=save_freq,
-                  eval_percent=eval_percent, period_save=period_save
+                  eval_percent=eval_percent, period_save=period_save, scaling=scaling
                   )
-__main__()
+
+MEM_CACHED = None
+MEM_CACHED_EVAL = None
+if __name__ == "__main__":
+    main()
