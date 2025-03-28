@@ -1,4 +1,4 @@
-import os, logging
+import os, logging, sys
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
@@ -9,7 +9,7 @@ from astropy.io import fits
 from photutils.segmentation import detect_threshold, detect_sources
 from photutils.utils import circular_footprint
 from mast import download_images
-from new_train import open_fits, save_fits
+from new_train import save_fits
 
 ####### HELPER FUNCTIONS###########################
 def create_dir(save_dir):
@@ -39,6 +39,42 @@ def create_dir(save_dir):
         logging.warning(f'an error occurred while creating the directory: {save_dir}, {err}')
         return False
     
+def open_fits(filepath, type_of_image='SCI'):
+    """
+    USED WITH 'data_augment()' function for images where data is given in electrons
+
+    Opens a .fits file, extracts the specified image data and exposure time, 
+    and filters based on the adjusted exposure time.
+
+    Args:
+        filepath (str): The path to the .fits file.
+        type_of_image (str, optional): The image type to extract (e.g., 'SCI'). 
+                                       Defaults to 'SCI'
+
+    Returns:
+        tuple or None: Returns `image_data` if 
+                       the file meets the criteria, otherwise returns `None`.
+
+    Raises:
+        Warning: Logs a warning if an error occurs while reading the .fits file.
+    """
+    try:
+        with fits.open(filepath) as f:
+            out = None
+            for hdu in f:
+                if isinstance(hdu, (fits.PrimaryHDU, fits.ImageHDU, fits.CompImageHDU)) and isinstance(hdu.data, np.ndarray):
+                    if out is None and type_of_image.lower() == str(hdu.name).lower():
+                        out = hdu.data
+                        header = hdu.header
+                if out is not None:
+                    break
+            if out is None:
+                return None
+            return out, header
+    except Exception as err:
+        logging.warning(f'Error occurred while reading the .fits file: {err}')
+        return None
+    
 def masked_open_fits(filepath):
     """
     Opens a FITS file and extracts the first valid image data array.
@@ -52,7 +88,7 @@ def masked_open_fits(filepath):
         with fits.open(filepath) as f:
             for hdu in f:
                 if isinstance(hdu, (fits.PrimaryHDU, fits.ImageHDU, fits.CompImageHDU)) and isinstance(hdu.data, np.ndarray):
-                    return hdu.data, filepath
+                    return hdu.data
             logging.warning(f"No valid image data found in {filepath}")
             return None
     except Exception as e:
@@ -134,7 +170,7 @@ def crop_image(image, filename, save_dir, ps=256):
     for i in range(n_H):
         for j in range(n_W):
             cropped_image = image[i * ps:(i + 1) * ps, j * ps:(j + 1) * ps]
-            new_filename = f"{os.path.basename(filename).split('.')[0]}_{i}_{j}.fits"
+            new_filename = f"{os.path.basename(filename).split('.')[0]}_{i}_{j}"
             save_fits(cropped_image, new_filename, save_dir+'/')
         
 def process_image_cropping(file, dir_, ps=256, type_of_image='SCI'):
@@ -158,13 +194,12 @@ def process_image_cropping(file, dir_, ps=256, type_of_image='SCI'):
     Raises:
         - Logs a warning if the input image cannot be opened or if the save directory cannot be created.
     """
-    img = open_fits(file, type_of_image)
+    img, header = open_fits(file, type_of_image)
     if img is None:
         return 
-    img, filepath, ex_time = img
     save_dir = os.path.join('./', dir_)
     crop_image(img, file, save_dir, ps=ps)
-    return 
+    return header, file
 
 def calculate_image_stats(data: np.ndarray, sigma: float = 3.0, nsigma: float = 2.0, 
                            npixels: int = 10, footprint_radius: int = 10,  maxiters: int = 10, step: int = 5):
@@ -253,7 +288,7 @@ def classify_data(data, step):
     
     ####################FILTERING AND DOWNLOADING DATA################################
 
-def filter_out_metadata(filepath, col, exp_column, allowed_survey, size=1000, low=100, high=10000, seed=42):
+def filter_out_metadata(filepath, col, exp_column, allowed_survey, size=1000, low=100, high=10000, times=2, seed=42, normal=False):
     """
     Filters and samples metadata from a CSV file based on specific conditions.
 
@@ -300,14 +335,18 @@ def filter_out_metadata(filepath, col, exp_column, allowed_survey, size=1000, lo
     
     
     df = df[df[col].isin(allowed_survey)]
-    df = df[(df[exp_column] <= high) & (df[exp_column] >= low)]
+    df = df[(df[exp_column] <= high) & (df[exp_column] >= times*low)]
 
     df.sample(frac=1, random_state=seed).reset_index(drop=True, inplace=True)
+
+    if len(df) <= size:
+        return df
+    
     df['temp_index'] = np.arange(0, len(df))
     part1 = df.drop_duplicates(subset=[exp_column], keep='first')
     part1.reset_index(drop=True, inplace=True)
 
-    if len(part1) < size:
+    if len(part1) <= size:
         subdf = df[~df['temp_index'].isin(part1['temp_index'])]
         subdf.sort_values(by=[exp_column], inplace=True)
         subdf.reset_index(drop=True, inplace=True)
@@ -315,16 +354,28 @@ def filter_out_metadata(filepath, col, exp_column, allowed_survey, size=1000, lo
         np.random.seed(seed)
         additional_size = size - len(part1)
 
-        indices = np.random.normal(loc=len(subdf) // 2, scale=len(subdf) // 4, size=additional_size)
-        unique_indices = np.unique(indices)
-        unique_indices = np.clip(unique_indices, 0, len(subdf) - 1).astype(int)
+        if normal:
+            unique_indices = set(part1['temp_index'].values)
 
-        np.random.shuffle(unique_indices)
-        part2 = subdf.iloc[unique_indices]
+            while len(unique_indices) < size:
+                indices = np.random.normal(loc=len(subdf) // 2, scale=len(subdf) // 4, size=additional_size)
+                indices = np.floor(indices).astype(int)
+                valid_indices = indices[(indices >= 0) & (indices < len(subdf))]
+                unique_indices.update(valid_indices)
+
+            unique_indices -= set(part1['temp_index'].values)
+            unique_indices = list(unique_indices)
+            np.random.shuffle(unique_indices)
+            unique_indices = unique_indices[:additional_size]
+            part2 = subdf.iloc[unique_indices]
+        else:
+            part2 = subdf.iloc[-additional_size:]
+
         part1 = pd.concat([part1, part2], ignore_index=True)
-
-    part1.drop(['temp_index'], inplace=True, axis=1)
-    part1.sort_values(by=[exp_column], inplace=True)
+        part1 = part1.drop_duplicates(subset=['temp_index']).drop(['temp_index'], axis=1)
+    else:
+        part1 = part1.drop_duplicates(subset=['temp_index']).drop(['temp_index'], axis=1)
+        part1.sort_values(by=[exp_column], inplace=True)
     return part1
 
 def test_train_validation_split(dataset_dir, dataset_metadata, url_column, split=(60, 20, 20), seed=42):
@@ -437,14 +488,15 @@ def process_image_stats(file, type_of_image='SCI', sigma=3, nsigma=2, npixels=10
     img = open_fits(file, type_of_image)
     if img is None:
         return 
-    img, filepath, ex_time = img
+    img, header = img
     img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
-    (mean, median, std, abs_mean, mean_light, median_light, std_light), mask, percentage_stats = calculate_image_stats(img, sigma, nsigma, npixels, footprint_radius,  maxiters, step)
+    img = np.maximum(img, 0.0)
+    (mean_light, median_light, std_light, abs_mean, mean, median, std), mask, percentage_stats = calculate_image_stats(img, sigma, nsigma, npixels, footprint_radius,  maxiters, step)
     if save and not np.all(np.isnan(mask)):
         dir_ = os.path.dirname(file)
         masked_path = os.path.join(dir_, 'masked_images')
         create_dir(masked_path)
-        save_fits(img[mask], f'masked_{os.path.basename(file)}', masked_path + '/')
+        save_fits(img[mask], f"masked_{os.path.basename(file).split('.')[0]}", masked_path + '/')
     
     to_be_returned = {'filename':os.path.basename(file), 'location':file, 'mean':mean, 'median':median, 'std':std, 'abs_mean':abs_mean,
                         'light_mean':mean_light, 'light_median':median_light, 'light_std':std_light}
@@ -487,9 +539,9 @@ def masked_process_image_stats(file, type_of_image='SCI', sigma=3, nsigma=2, npi
     img = masked_open_fits(file)
     if img is None:
         return 
-    img, filepath = img
     img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
-    (mean, median, std, abs_mean, mean_light, median_light, std_light), mask, percentage_stats = calculate_image_stats(img, sigma, nsigma, npixels, footprint_radius,  maxiters, step)
+    img = np.maximum(img, 0.0)
+    (mean_light, median_light, std_light, abs_mean, mean, median, std), mask, percentage_stats = calculate_image_stats(img, sigma, nsigma, npixels, footprint_radius,  maxiters, step)
     if save and not np.all(np.isnan(mask)):
         save_fits(img[mask], f'masked_{os.path.basename(file)}', masked_path + '/')
     
@@ -499,7 +551,7 @@ def masked_process_image_stats(file, type_of_image='SCI', sigma=3, nsigma=2, npi
     return to_be_returned
 
 def control_flow(dataset_dir, filepath, survey_column, exp_column, id_column, url_column, allowed_survey, download=False, masking=True,
-                 masking_cropped=False, save=True, size=1000, low=100, high=1000, seed=42, split=(60, 20, 20), max_requests=5, reset_after=10,
+                 masking_cropped=False, save=True, size=1000, low=100, high=1000, times=2, seed=42, normal=False, split=(60, 20, 20), max_requests=5, reset_after=10,
                 type_of_image='SCI', sigma=3, nsigma=2, npixels=10, footprint_radius=10, maxiters=10, ps=256, max_workers=16, step=5):
     """
     Orchestrates the data processing and image downloading, including metadata filtering, image cropping, 
@@ -557,7 +609,7 @@ def control_flow(dataset_dir, filepath, survey_column, exp_column, id_column, ur
     output_filtered_metadata_filename = './filtered_metadata.csv'
     if download:
         filtered_metadata = filter_out_metadata(os.path.join(os.path.dirname(os.getcwd()), filepath), survey_column,
-                                                 exp_column, allowed_survey, size=size, low=low, high=high, seed=seed)
+                                                 exp_column, allowed_survey, size=size, low=low, high=high, times=times,  seed=seed, normal=normal)
         filtered_metadata.to_csv(output_filtered_metadata_filename, index=False)
         if filtered_metadata is None:
             return
@@ -577,13 +629,25 @@ def control_flow(dataset_dir, filepath, survey_column, exp_column, id_column, ur
             if result is None:
                 continue
         
+            headers = {}
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [executor.submit(process_image_cropping, file, dir_, ps, type_of_image)
                         for file in [os.path.join(save_dir, f) for f in os.listdir(save_dir) if f.endswith('.fits')]]
                 
                 for future in as_completed(futures):
                     if future is not None:
-                        future.result()
+                        result = future.result()
+                        if result is not None:
+                            header, file = result
+                            headers[os.path.basename(file)] = header
+            actual_exposure_times = {}
+            delta_tim = {}
+            for filename, header in headers.items():
+                try:
+                    actual_exposure_times[filename] = header['SAMPTIME']
+                    delta_tim[filename] = header['DELTATIM']
+                except Exception as err:
+                    print(f'an error occurred:{err}')
 
     noisy_filtered_metadata_output_file = './metadata_filepath_enriched_with_noise.csv'
     if masking:
@@ -593,7 +657,8 @@ def control_flow(dataset_dir, filepath, survey_column, exp_column, id_column, ur
             save_dir = os.path.join(folder, 'originals')
             if not os.path.exists(folder) or not os.path.exists(save_dir):
                 continue
-                
+            
+            
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [executor.submit(process_image_stats, file, type_of_image, sigma, nsigma, npixels, footprint_radius, maxiters, step, save)
                         for file in [os.path.join(save_dir, f) for f in os.listdir(save_dir) if f.endswith('.fits')]]
@@ -622,6 +687,12 @@ def control_flow(dataset_dir, filepath, survey_column, exp_column, id_column, ur
         filtered_metadata = pd.read_csv(output_filtered_metadata_filename)
         filtered_metadata['filename'] = filtered_metadata[url_column].apply(lambda url:  url.split('%2F')[-1])
         filtered_metadata = filtered_metadata.merge(noise_attributes, on='filename', how='left')
+        filtered_metadata['actual_exp_time'] = filtered_metadata.apply(
+            lambda x: float(actual_exposure_times.get(x['filename'], x[exp_column])), axis=1
+        )
+        filtered_metadata['delta_time'] = filtered_metadata.apply(
+            lambda x: float(delta_tim.get(x['filename'], x[exp_column])), axis=1
+        )
         filtered_metadata.to_csv(noisy_filtered_metadata_output_file, index=False)
 
     if masking_cropped:
@@ -632,7 +703,12 @@ def control_flow(dataset_dir, filepath, survey_column, exp_column, id_column, ur
         # Load filtered metadata and extract original_filename
         filtered_metadata = pd.read_csv(output_filtered_metadata_filename)
         filtered_metadata['original_filename'] = filtered_metadata[url_column].apply(lambda url: url.split('%2F')[-1])
-
+        filtered_metadata['actual_exp_time'] = filtered_metadata.apply(
+            lambda x: float(actual_exposure_times.get(x['original_filename'], x[exp_column])), axis=1
+        )
+        filtered_metadata['delta_time'] = filtered_metadata.apply(
+            lambda x: float(delta_tim.get(x['original_filename'], x[exp_column])), axis=1
+        )
         # Load noisy filtered metadata, extract original_filename, and rename columns
         noisy_filtered_metadata = pd.read_csv(noisy_filtered_metadata_output_file)
         noisy_filtered_metadata['original_filename'] = noisy_filtered_metadata[url_column].apply(lambda url: url.split('%2F')[-1])
@@ -643,9 +719,10 @@ def control_flow(dataset_dir, filepath, survey_column, exp_column, id_column, ur
         noisy_filtered_metadata.rename(columns={f'{col}': f'org_{col}' for col in cols if col != 'original_filename'}, inplace=True)
 
         # Merge datasets
+        filtered_metadata = filtered_metadata.merge(noisy_filtered_metadata, on='original_filename', how='left')
+        filtered_metadata.dropna(subset=['org_mean'], inplace=True)
+        cropped_image_attributes.dropna(subset=['filename', 'location', 'mean'], inplace=True)
         cropped_image_attributes = filtered_metadata.merge(cropped_image_attributes, on='original_filename', how='left')
-        cropped_image_attributes = cropped_image_attributes.merge(noisy_filtered_metadata, on='original_filename', how='left')
-
         # Save the final result
         cropped_image_attributes.to_csv('./cropped_images_stats.csv', index=False)
 
@@ -657,8 +734,10 @@ def main():
     except Exception as err:
         logging.warning(f'an error occurred while changing the working directory to {directory}, {err}')
 
-    dataset_directory = 'nsigma3_fprint_5_npixels_5'
+    dataset_directory = 'sigma2_nsigma2_fp_3'
+    dataset_directory = 'gal_data_sigma2_nsigma2_fp_3'
     filepath = 'hst_wfc3_f160W_metadata.csv'
+    filepath = 'metadata_gal.csv'
     survey_column = 'sci_aper_1234'
     exp_column = 'sci_actual_duration'
     id_column = 'sci_data_set_name'
@@ -668,26 +747,33 @@ def main():
     masking = True
     masking_cropped = True
     save = True
-    size = 100
-    low = 250
-    high = 15000
-    seed = 42
-    split = (60, 20, 20)
+    size = 3000
+    low = 100
+    times = 2
+    high = 20000
+    seed = 46
+    normal = True
+    split = (70, 15, 15)
     max_requests = 5
     reset_after = 10
-    type_of_image = 'DRZ'
-    sigma = 3
-    nsigma = 3 
+    type_of_image = 'SCI'
+    sigma = 2
+    nsigma = 2
     npixels = 5
-    footprint_radius = 5
-    maxiters = 25
+    footprint_radius = 3
+    maxiters = 10
     ps = 256
     max_workers = 16
     step = 1
 
+    if len(sys.argv) > 1:
+        dataset_directory = sys.argv[1]
+    if len(sys.argv) > 2:
+        filepath = sys.argv[2]
+
     control_flow(dataset_directory, filepath, survey_column, exp_column, id_column, url_column, allowed_survey,
                 download, masking, masking_cropped, save,
-                size, low, high, seed, split, max_requests, reset_after,
+                size, low, high, times, seed, normal, split, max_requests, reset_after,
                 type_of_image, sigma, nsigma, npixels, footprint_radius, maxiters, ps, max_workers, step)
     
 main()
